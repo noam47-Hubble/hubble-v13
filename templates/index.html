@@ -1,0 +1,637 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Hubble</title>
+<link rel="manifest" href="/static/manifest.json">
+<link rel="icon" href="/static/icons/icon-192.png">
+<link rel="apple-touch-icon" href="/static/icons/apple-touch-icon.png">
+<meta name="theme-color" content="#12141f">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Hubble">
+<link rel="stylesheet" href="/static/style.css?v={{ v }}">
+</head>
+<body>
+<div id="app">
+
+  <!-- ===================== TOP BAR (present on every screen) ===================== -->
+  <div class="topbar">
+    <button id="btn-home" class="brand brand-btn">
+      <span class="brand-mark">H<span class="unread-blink-dot hidden" id="home-unread-dot" title="הודעות פרטיות חדשות"></span></span>
+      <span class="brand-name">Hubble</span>
+    </button>
+    <div class="topbar-right">
+      <span class="phase-tag">שלב 2</span>
+      <button id="active-card-chip" class="card-chip">בחר כרטיס פעיל</button>
+    </div>
+  </div>
+
+  <!-- ===================== SCREEN: HOME ===================== -->
+  <section id="screen-home" class="screen wrap">
+    <div class="home-actions">
+      <button id="btn-open-hub" class="btn btn-primary">+ פתיחת האב חדש</button>
+      <button id="btn-my-contacts" class="btn btn-ghost">אנשי הקשר שלי</button>
+      <button id="btn-my-messages" class="btn btn-ghost">ההודעות שלי <span id="messages-unread-badge" class="unread-badge hidden">0</span></button>
+      <button id="btn-my-cards" class="btn btn-ghost">הכרטיסים שלי</button>
+    </div>
+
+    <h2 class="section-title">האבים</h2>
+    <div class="search-row">
+      <input type="text" id="hub-search-input" placeholder="חיפוש האב לפי שם או מספר סידורי (4 ספרות)">
+      <button id="btn-hub-search-clear" class="btn btn-ghost btn-small hidden">נקה</button>
+    </div>
+    <div class="tabs">
+      <button class="tab active" data-filter="all">כל ההאבים ברשת</button>
+      <button class="tab" data-filter="near">האבים לידי</button>
+      <button class="tab" data-filter="favorites">מועדפים</button>
+      <button class="tab" data-filter="mine">האבים שלי</button>
+    </div>
+
+    <div id="hub-list" class="hub-list"></div>
+
+    <div class="sync-box">
+      <p class="section-label">חיבור בין מכשירים</p>
+      <p class="hint">כל דפדפן/מכשיר הוא "משתמש" נפרד כברירת מחדל. כדי שהכרטיסים וההאבים שלך יופיעו גם בדפדפן/מכשיר אחר, הזן כאן את הקוד מהמכשיר הראשון.</p>
+      <div class="sync-row">
+        <span>הקוד שלי: <b id="my-sync-code">—</b></span>
+        <input type="text" id="sync-code-input" placeholder="הזן קוד ממכשיר אחר">
+        <button id="btn-sync-link" class="btn btn-ghost btn-small">חבר</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================== SCREEN: MY CARDS ===================== -->
+  <section id="screen-cards" class="screen wrap hidden">
+    <h1 class="headline">הכרטיסים שלי</h1>
+    <p class="sub">אפשר להחזיק כמה כרטיסים. רק אחד יכול להיות פעיל בכל רגע — זה הכרטיס שאיתו נכנסים להאבים.</p>
+    <div id="card-list" class="card-list"></div>
+    <button id="btn-new-card" class="btn btn-primary">+ כרטיס חדש</button>
+  </section>
+
+  <!-- ===================== SCREEN: MY MESSAGES ===================== -->
+  <section id="screen-messages" class="screen wrap hidden">
+    <div id="messages-inbox-view">
+      <h1 class="headline">ההודעות שלי</h1>
+      <p class="sub">שיחות פרטיות מכל ההאבים. אפשר להשיב גם בלי להיות כרגע בתוך ההאב.</p>
+      <div id="messages-list" class="card-list"></div>
+    </div>
+
+    <div id="messages-thread-view" class="hidden">
+      <button id="btn-thread-back" class="btn btn-ghost btn-small">← חזרה לרשימת ההודעות</button>
+      <h2 id="thread-title" class="section-title"></h2>
+      <div id="thread-status" class="hint"></div>
+      <div id="thread-list" class="message-list thread-message-list"></div>
+      <form id="form-thread-reply" class="composer">
+        <input type="text" id="thread-reply-input" placeholder="הקלד תשובה...">
+        <button type="submit" class="btn btn-primary">שלח</button>
+      </form>
+    </div>
+  </section>
+
+  <!-- ===================== SCREEN: MY CONTACTS ===================== -->
+  <section id="screen-contacts" class="screen wrap hidden">
+    <h1 class="headline">אנשי הקשר שלי</h1>
+    <p class="sub">כרטיסים שאנשים שלחו לך, או ששמרת ישירות מתוך רשימת נוכחים בהאב.</p>
+
+    <div class="groups-bar">
+      <div id="groups-list" class="groups-list"></div>
+      <button id="btn-new-group" class="btn btn-ghost btn-small">+ קבוצה חדשה</button>
+    </div>
+
+    <div id="contacts-list" class="card-list"></div>
+  </section>
+
+  <!-- ===================== MODAL: GROUP DETAIL (VIEW/ADD/REMOVE MEMBERS) ===================== -->
+  <div id="group-detail-overlay" class="overlay hidden">
+    <div class="editor editor-small">
+      <div class="editor-head">
+        <h2 id="group-detail-title">קבוצה</h2>
+        <button class="btn btn-ghost btn-close-modal">✕</button>
+      </div>
+      <h3 class="section-title" style="font-size:14px; margin-top:4px;">חברי הקבוצה</h3>
+      <div id="group-detail-members" class="card-list"></div>
+      <h3 class="section-title" style="font-size:14px; margin-top:16px;">הוספה מתוך אנשי הקשר שלי</h3>
+      <div id="group-detail-add" class="card-list"></div>
+    </div>
+  </div>
+
+  <!-- ===================== MODAL: "WHERE ARE THEY" RESULTS ===================== -->
+  <div id="group-where-overlay" class="overlay hidden">
+    <div class="editor editor-small">
+      <div class="editor-head">
+        <h2>איפה הם עכשיו</h2>
+        <button class="btn btn-ghost btn-close-modal">✕</button>
+      </div>
+      <div id="group-where-body" class="card-list"></div>
+    </div>
+  </div>
+
+  <!-- ===================== MODAL: SEND MESSAGE TO A GROUP ===================== -->
+  <div id="group-message-overlay" class="overlay hidden">
+    <div class="editor editor-small">
+      <div class="editor-head">
+        <h2 id="group-message-title">הודעה לקבוצה</h2>
+        <button class="btn btn-ghost btn-close-modal">✕</button>
+      </div>
+      <input type="text" id="group-message-input" placeholder="ההודעה שלך לכל חברי הקבוצה...">
+      <button id="btn-send-group-message" class="btn btn-primary" style="width:100%; margin-top:10px;">שלח לכולם</button>
+    </div>
+  </div>
+
+  <!-- ===================== SCREEN: INSIDE A HUB ===================== -->
+  <section id="screen-hub" class="screen hidden">
+    <div class="hub-topbar">
+      <div id="hub-title" class="hub-title"></div>
+      <div class="hub-status-toggle">
+        <button id="btn-hub-report" class="btn btn-ghost hidden">📄 דוח</button>
+        <button id="btn-owner-controls" class="btn btn-ghost hidden">⚙️ ניהול האב</button>
+      </div>
+    </div>
+
+    <div id="conference-banner" class="conference-banner hidden">
+      <img id="conference-logo" class="conference-logo hidden">
+      <div>
+        <div id="conference-tagline" class="conference-tagline"></div>
+        <div id="conference-meta" class="conference-meta"></div>
+      </div>
+      <div id="owner-publish-row" class="hidden">
+        <button id="btn-publish-hub" class="btn btn-primary btn-small">פרסם את הכנס</button>
+      </div>
+    </div>
+
+    <audio id="hub-music" loop></audio>
+
+    <div id="hub-view-toggle" class="hub-view-toggle hidden">
+      <button class="hub-view-btn active" data-view="communication">תקשורת</button>
+      <button class="hub-view-btn" data-view="data">נתוני הכנס</button>
+    </div>
+
+    <div id="hub-communication-view">
+      <div class="hub-layout">
+        <aside class="participants">
+          <h3>נוכחים <span id="participant-count" class="count-badge">0</span></h3>
+          <div id="participant-list"></div>
+        </aside>
+
+        <main class="chat">
+          <div class="chat-tabs">
+            <button class="chat-tab active" data-tab="board">לוח כללי</button>
+            <button class="chat-tab" data-tab="private">הודעות פרטיות <span id="private-unread-badge" class="unread-badge hidden">0</span></button>
+          </div>
+
+          <div id="board-panel" class="chat-panel">
+            <div id="board-list" class="message-list"></div>
+            <form id="form-board-send" class="composer">
+              <label class="img-btn"> 📷 <input type="file" id="board-image-input" accept="image/*" hidden></label>
+              <input type="text" id="board-text-input" placeholder="שתפו את כל ההאב...">
+              <button type="submit" class="btn btn-primary">שלח</button>
+            </form>
+          </div>
+
+          <div id="private-panel" class="chat-panel hidden">
+            <div id="private-target-bar" class="private-target-bar">בחרו איש קשר ירוק מהרשימה כדי לשלוח הודעה פרטית</div>
+            <div id="private-list" class="message-list"></div>
+            <form id="form-private-send" class="composer hidden">
+              <label class="img-btn"> 📷 <input type="file" id="private-image-input" accept="image/*" hidden></label>
+              <input type="text" id="private-text-input" placeholder="הודעה פרטית...">
+              <button type="submit" class="btn btn-primary">שלח</button>
+            </form>
+          </div>
+        </main>
+      </div>
+    </div>
+
+    <div id="hub-data-view">
+      <div class="hub-data-section">
+        <h3 class="section-title">כל הרשומים</h3>
+        <div id="directory-list" class="card-list"></div>
+      </div>
+      <div class="hub-data-section">
+        <h3 class="section-title">תוכנית הכנס</h3>
+        <div id="owner-blocks-editor" class="hidden">
+          <div class="field-row-simple">
+            <input type="text" id="new-block-title" placeholder="כותרת (למשל: לו״ז, מרצים, ספונסרים)">
+          </div>
+          <textarea id="new-block-content" placeholder="תוכן חופשי..." rows="2"></textarea>
+          <button id="btn-add-block" class="btn btn-primary btn-small">+ הוסף בלוק</button>
+        </div>
+        <div id="program-list"></div>
+      </div>
+      <div id="hub-organizer-footer" class="hub-organizer-footer hidden"></div>
+    </div>
+  </section>
+
+  <!-- ===================== MODAL: VIEW A PARTICIPANT'S CARD ===================== -->
+  <div id="view-card-overlay" class="overlay hidden">
+    <div class="editor editor-small">
+      <div class="editor-head">
+        <h2 id="view-card-title">כרטיס</h2>
+        <button class="btn btn-ghost btn-close-modal">✕</button>
+      </div>
+      <div id="view-card-body" class="view-card-body"></div>
+      <div id="view-card-actions" class="view-card-actions"></div>
+    </div>
+  </div>
+
+  <!-- ===================== MODAL: SHARE MY CONTACT DETAILS ===================== -->
+  <div id="share-contact-overlay" class="overlay hidden">
+    <div class="editor editor-small">
+      <div class="editor-head">
+        <h2>שליחת פרטי קשר</h2>
+        <button class="btn btn-ghost btn-close-modal">✕</button>
+      </div>
+      <p class="sub">בחרו אילו שדות מהכרטיס הפעיל שלכם לשלוח.</p>
+      <div id="share-fields-list" class="share-fields-list"></div>
+      <button id="btn-send-contact" class="btn btn-primary" style="width:100%">שלח פרטי קשר</button>
+    </div>
+  </div>
+
+  <!-- ===================== MODAL: RECEIVED A CONTACT OFFER ===================== -->
+  <div id="contact-offer-overlay" class="overlay hidden">
+    <div class="editor editor-small">
+      <div class="editor-head">
+        <h2>קיבלת פרטי קשר</h2>
+        <button class="btn btn-ghost btn-close-modal">✕</button>
+      </div>
+      <div id="contact-offer-body" class="view-card-body"></div>
+      <label class="note-label">הערות שלי</label>
+      <input type="text" id="contact-note-input" placeholder="איך נפגשנו / למה לחזור אליו">
+      <button id="btn-save-contact" class="btn btn-primary" style="width:100%">שמור באנשי הקשר</button>
+    </div>
+  </div>
+
+  <!-- ===================== MODAL: OWNER CONTROLS ===================== -->
+  <div id="owner-controls-overlay" class="overlay hidden">
+    <div class="editor">
+      <div class="editor-head">
+        <h2>ניהול ההאב</h2>
+        <button class="btn btn-ghost btn-close-modal">✕</button>
+      </div>
+
+      <div id="owner-edit-conference-row" class="hidden">
+        <button id="btn-edit-conference-data" class="btn btn-ghost" style="width:100%; margin-bottom:14px;">✏️ עריכת נתוני הכנס</button>
+      </div>
+
+      <div id="owner-legacy-controls">
+        <p class="section-label">תמונת רקע</p>
+        <input type="file" id="owner-bg-image-input" accept="image/*">
+        <img id="owner-bg-preview" class="photo-preview hidden" style="border-radius:8px;width:100%;height:100px;object-fit:cover;">
+
+        <p class="section-label">מוזיקת רקע (לופ)</p>
+        <input type="file" id="owner-bg-music-input" accept="audio/*">
+        <div id="owner-music-name" class="hint"></div>
+      </div>
+
+      <p class="section-label">נוכחים — חסימת פרסום</p>
+      <div id="owner-participant-list" class="card-list"></div>
+
+      <div id="owner-pending-section" class="hidden">
+        <p class="section-label">ממתינים לאישור <span id="pending-count-badge" class="unread-badge hidden">0</span></p>
+        <div id="owner-pending-list" class="card-list"></div>
+      </div>
+
+      <div id="owner-broadcast-section" class="hidden">
+        <p class="section-label">שידור לנרשמים</p>
+        <button id="btn-open-broadcast" class="btn btn-ghost" style="width:100%">📣 שלח הודעה לכל הנרשמים המאושרים</button>
+      </div>
+
+      <button id="btn-owner-close-hub" class="btn btn-danger" style="width:100%; margin-top:16px;">סגור את ההאב לכולם</button>
+    </div>
+  </div>
+
+  <!-- ===================== MODAL: ORGANIZER BROADCAST ===================== -->
+  <div id="broadcast-overlay" class="overlay hidden">
+    <div class="editor editor-small">
+      <div class="editor-head">
+        <h2>שידור לנרשמים</h2>
+        <button class="btn btn-ghost btn-close-modal">✕</button>
+      </div>
+      <div class="field-row-simple">
+        <label>קהל יעד</label>
+        <select id="broadcast-target">
+          <option value="all_approved">כל הנרשמים המאושרים</option>
+          <option value="pending">רק ממתינים לאישור</option>
+        </select>
+      </div>
+      <textarea id="broadcast-text" placeholder="ההודעה שלך..." rows="3"></textarea>
+      <button id="btn-send-broadcast" class="btn btn-primary" style="width:100%; margin-top:8px;">שלח שידור</button>
+    </div>
+  </div>
+
+  <!-- ===================== MODAL: OPEN A NEW HUB ===================== -->
+  <div id="open-hub-overlay" class="overlay hidden">
+    <div class="editor">
+      <div class="editor-head">
+        <h2>פתיחת האב חדש</h2>
+        <button class="btn btn-ghost btn-close-modal">✕</button>
+      </div>
+      <form id="form-open-hub" class="card-form">
+        <div class="field-row-simple">
+          <label>סוג</label>
+          <select name="hub_type" id="open-hub-type-select">
+            <option value="social">חברתי</option>
+            <option value="professional">מקצועי — כנס</option>
+            <option value="business">עסקי</option>
+          </select>
+        </div>
+        <div id="hub-name-row" class="field-row-simple">
+          <label>שם ההאב</label>
+          <input type="text" name="name" placeholder="המסיבה של נועם" required>
+        </div>
+
+        <div id="social-business-fields">
+          <div class="field-row-simple">
+            <label>תיאור</label>
+            <input type="text" name="description" placeholder="מה קורה כאן">
+          </div>
+          <div class="field-row-simple">
+            <label>שם רשת WiFi (תיאורי)</label>
+            <input type="text" name="wifi_label" placeholder="Hubble-Event (לא חובה)">
+          </div>
+        </div>
+
+        <p id="professional-hub-hint" class="hint hidden">בוחרים "מקצועי" ועוברים ישר למסך הגדרת הכנס.</p>
+
+        <div id="open-hub-error" class="form-error hidden"></div>
+        <button type="submit" class="btn btn-primary" id="btn-open-hub-submit">פתח האב</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- ===================== SCREEN: CONFERENCE SETUP (create + edit, same screen) ===================== -->
+  <section id="screen-conference-setup" class="screen wrap hidden">
+    <h1 class="headline">הגדרת כנס</h1>
+    <p class="sub">שם הכנס יהיה גם שם ההאב. כל שאר השדות הם רשות — לכל שדה יש מתג נפרד שקובע אם הוא יוצג.</p>
+
+    <div class="field-row-simple">
+      <label>שם הכנס/תערוכה (חובה)</label>
+      <input type="text" id="cs-name" placeholder="TechInnovate 2026">
+    </div>
+
+    <h3 class="section-title">שדות בכותרת ההאב</h3>
+    <div class="cs-field-row">
+      <label class="vis-toggle"><input type="checkbox" id="cs-tagline-visible" checked> מהות הכנס (כותרת משנה)</label>
+      <input type="text" id="cs-tagline" placeholder="פסגת החדשנות הטכנולוגית לשנת 2026">
+    </div>
+    <div class="cs-field-row">
+      <label class="vis-toggle"><input type="checkbox" id="cs-location-visible" checked> מיקום</label>
+      <input type="text" id="cs-location" placeholder="מרכז הכנסים, תל אביב">
+    </div>
+    <div class="cs-field-row">
+      <label class="vis-toggle"><input type="checkbox" id="cs-dates-visible" checked> תאריכים</label>
+      <input type="text" id="cs-dates" placeholder="14–16 בנובמבר 2026 (אפשר גם יום בודד)">
+    </div>
+    <div class="cs-field-row">
+      <label class="vis-toggle"><input type="checkbox" id="cs-logo-visible" checked> לוגו הכנס</label>
+      <input type="file" id="cs-logo-input" accept="image/*">
+      <img id="cs-logo-preview" class="photo-preview hidden">
+    </div>
+
+    <h3 class="section-title">שדות בגוף הדף <span class="hint">(רק הכותרת מוצגת בהאב — לחיצה עליה, או תצוגה קבועה, לפי בחירתך)</span></h3>
+    <div id="cs-blocks-list"></div>
+    <button id="btn-cs-add-block" class="btn btn-ghost" style="width:100%">+ הוספת שדה רשות</button>
+
+    <h3 class="section-title">שדות בתחתית ההאב</h3>
+    <div class="cs-field-row">
+      <label class="vis-toggle"><input type="checkbox" id="cs-organizers-visible" checked> שם המארגנים</label>
+      <input type="text" id="cs-organizers" placeholder="נועם כהן, דנה לוי">
+    </div>
+
+    <h3 class="section-title">עיצוב</h3>
+    <div id="cs-template-picker" class="template-picker"></div>
+    <input type="hidden" id="cs-template-id" value="corporate_classic">
+
+    <div id="cs-error" class="form-error hidden"></div>
+
+    <div class="cs-actions">
+      <button id="btn-cs-save-draft" class="btn btn-ghost">שמירה כטיוטה</button>
+      <button id="btn-cs-preview" class="btn btn-ghost">תצוגה מקדימה 👁</button>
+      <button id="btn-cs-publish" class="btn btn-primary">פרסום 🚀</button>
+    </div>
+  </section>
+
+  <!-- ===================== MODAL: PICK OPTIONAL-FIELD CATEGORY ===================== -->
+  <div id="cs-category-overlay" class="overlay hidden">
+    <div class="editor editor-small">
+      <div class="editor-head">
+        <h2>בחר כותרת</h2>
+        <button class="btn btn-ghost btn-close-modal">✕</button>
+      </div>
+      <div id="cs-category-list" class="category-picker"></div>
+    </div>
+  </div>
+
+  <!-- ===================== MODAL: OPTIONAL-FIELD CONTENT EDITOR ===================== -->
+  <div id="cs-block-editor-overlay" class="overlay hidden">
+    <div class="editor editor-small">
+      <div class="editor-head">
+        <h2 id="cs-block-editor-title">הוסף תוכן</h2>
+        <button class="btn btn-ghost btn-close-modal">✕</button>
+      </div>
+      <div class="field-row-simple" id="cs-block-custom-title-row">
+        <label>כותרת מותאמת אישית</label>
+        <input type="text" id="cs-block-custom-title" placeholder="הקלד כותרת...">
+      </div>
+      <textarea id="cs-block-content" placeholder="הוסף תוכן..." rows="4"></textarea>
+      <div class="field-row-simple">
+        <label>תמונה (רשות)</label>
+        <input type="file" id="cs-block-image-input" accept="image/*">
+      </div>
+      <img id="cs-block-image-preview" class="photo-preview hidden">
+      <p class="section-label" style="margin-top:10px">אופן תצוגה בהאב</p>
+      <label class="vis-toggle"><input type="radio" name="cs-block-display" value="popup" checked> נפתח בחלון בלחיצה על הכותרת</label>
+      <label class="vis-toggle"><input type="radio" name="cs-block-display" value="inline"> מוצג קבוע בדף</label>
+      <div class="cs-actions" style="margin-top:12px">
+        <button id="btn-cs-block-delete" class="btn btn-danger hidden">מחק</button>
+        <button id="btn-cs-block-save" class="btn btn-primary">שמור</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===================== SCREEN: WAITING FOR APPROVAL ===================== -->
+  <div id="pending-approval-overlay" class="overlay hidden">
+    <div class="editor editor-small">
+      <div class="editor-head">
+        <h2>ממתין לאישור</h2>
+      </div>
+      <p class="sub" id="pending-approval-text">ההרשמה שלך ל<span id="pending-hub-name"></span> נשלחה. ברגע שהארגונאי יאשר אותך, תיכנס/י אוטומטית לכנס.</p>
+      <button id="btn-pending-cancel" class="btn btn-ghost" style="width:100%">חזרה לבית</button>
+    </div>
+  </div>
+
+  <!-- ===================== MODAL: REGISTRATION / LOGIN ===================== -->
+  <div id="register-overlay" class="overlay hidden">
+    <div class="editor editor-small">
+      <div class="editor-head">
+        <h2>ברוכים הבאים ל-Hubble</h2>
+      </div>
+      <p class="sub">לפני שנתחיל — איך קוראים לך, ואיך נזהה אותך אם תתחבר ממכשיר אחר?</p>
+      <div class="field-row-simple">
+        <label>שם</label>
+        <input type="text" id="reg-name-input" placeholder="נועם">
+      </div>
+      <div class="field-row-simple">
+        <label>מייל</label>
+        <input type="text" id="reg-email-input" placeholder="name@mail.com (לא חובה אם יש טלפון)">
+      </div>
+      <div class="field-row-simple">
+        <label>טלפון</label>
+        <input type="text" id="reg-phone-input" placeholder="050-0000000 (לא חובה אם יש מייל)">
+      </div>
+      <div id="register-error" class="form-error hidden"></div>
+      <button id="btn-register-submit" class="btn btn-primary" style="width:100%">המשך</button>
+    </div>
+  </div>
+
+  <!-- ===================== MODAL: INVITE LINK LANDING ===================== -->
+  <div id="invite-overlay" class="overlay hidden">
+    <div class="editor editor-small">
+      <div class="editor-head">
+        <h2>הוזמנת להאב</h2>
+      </div>
+      <p class="sub">הוזמנת להצטרף אל <b id="invite-hub-name"></b>.</p>
+      <div id="invite-no-card" class="hidden">
+        <p class="hint">כדי להיכנס צריך קודם ליצור כרטיס ביקור.</p>
+        <button id="btn-invite-create-card" class="btn btn-primary" style="width:100%">יצירת כרטיס והצטרפות</button>
+      </div>
+      <div id="invite-has-card" class="hidden">
+        <button id="btn-invite-join" class="btn btn-primary" style="width:100%">הצטרפות להאב</button>
+      </div>
+      <button id="btn-invite-cancel" class="btn btn-ghost" style="width:100%; margin-top:6px;">ביטול</button>
+    </div>
+  </div>
+
+  <!-- ===================== MODAL: REPORT OPTIONS ===================== -->
+  <div id="report-options-overlay" class="overlay hidden">
+    <div class="editor editor-small">
+      <div class="editor-head">
+        <h2>יצירת דוח</h2>
+        <button class="btn btn-ghost btn-close-modal">✕</button>
+      </div>
+      <p class="hint">בחר מה לכלול בדוח האישי שלך:</p>
+      <label class="vis-toggle"><input type="checkbox" id="report-include-modules" checked> תוכנית הכנס (מרצים, לו״ז, ספונסרים...)</label>
+      <label class="vis-toggle"><input type="checkbox" id="report-include-directory" checked> ספריית הרשומים המלאה</label>
+      <label class="vis-toggle"><input type="checkbox" id="report-include-contacts" checked> אנשי הקשר שלי מההאב הזה</label>
+      <button id="btn-generate-report" class="btn btn-primary" style="width:100%; margin-top:10px;">צור דוח</button>
+    </div>
+  </div>
+
+  <!-- ===================== SCREEN: PRINTABLE REPORT ===================== -->
+  <div id="report-view-overlay" class="overlay hidden">
+    <div class="editor report-view">
+      <div class="editor-head no-print">
+        <h2>דוח</h2>
+        <div>
+          <button id="btn-print-report" class="btn btn-primary btn-small">🖨️ הדפס / שמור כ-PDF</button>
+          <button class="btn btn-ghost btn-close-modal">✕</button>
+        </div>
+      </div>
+      <div id="report-content"></div>
+    </div>
+  </div>
+
+  <!-- ===================== MODAL: CARD EDITOR ===================== -->
+  <div id="editor-overlay" class="overlay hidden">
+    <div class="editor">
+      <div class="editor-head">
+        <h2 id="editor-title">כרטיס חדש</h2>
+        <button id="btn-close-editor" class="btn btn-ghost">✕</button>
+      </div>
+
+      <div id="type-picker" class="card-type-picker">
+        <button class="type-option" data-type="social">
+          <span class="type-icon">◐</span>
+          <span class="type-label">כרטיס חברתי</span>
+        </button>
+        <button class="type-option" data-type="business">
+          <span class="type-icon">◆</span>
+          <span class="type-label">כרטיס עסקי</span>
+        </button>
+      </div>
+
+      <form id="card-form" class="card-form hidden">
+        <div class="field-row">
+          <label>שם</label>
+          <input type="text" name="name" placeholder="נועם">
+          <label class="vis-toggle"><input type="checkbox" name="name_visible" checked> להציג</label>
+        </div>
+        <div class="field-row">
+          <label>כינוי</label>
+          <input type="text" name="nickname" placeholder="Nomi">
+          <label class="vis-toggle"><input type="checkbox" name="nickname_visible"> להציג</label>
+        </div>
+        <p class="hint">חייב להיות מסומן "להציג" לפחות אחד מבין שם/כינוי.</p>
+
+        <div class="field-row">
+          <label>תמונות</label>
+          <input type="file" id="photo-input" accept="image/*">
+        </div>
+        <p class="hint">אפשר להעלות כמה תמונות. לכל תמונה יש מתג "הצג בפרופיל" נפרד, ואפשר למחוק כל אחת.</p>
+        <div id="photo-gallery" class="photo-gallery"></div>
+
+        <div id="business-fields" class="hidden">
+          <div class="field-row">
+            <label>תפקיד</label>
+            <input type="text" name="title" placeholder="מייסד">
+            <label class="vis-toggle"><input type="checkbox" name="title_visible" checked> להציג</label>
+          </div>
+          <div class="field-row">
+            <label>חברה</label>
+            <input type="text" name="company" placeholder="Hubble">
+            <label class="vis-toggle"><input type="checkbox" name="company_visible" checked> להציג</label>
+          </div>
+        </div>
+
+        <div id="social-fields" class="hidden">
+          <div class="field-row">
+            <label>מצב רוח</label>
+            <input type="text" name="mood" placeholder="חוגג">
+            <label class="vis-toggle"><input type="checkbox" name="mood_visible" checked> להציג</label>
+          </div>
+          <div class="field-row">
+            <label>סטטוס</label>
+            <input type="text" name="status" placeholder="פתוח לשיחה">
+            <label class="vis-toggle"><input type="checkbox" name="status_visible" checked> להציג</label>
+          </div>
+          <div class="field-row">
+            <label>ביו</label>
+            <input type="text" name="bio" placeholder="שורה אחת עליי">
+            <label class="vis-toggle"><input type="checkbox" name="bio_visible" checked> להציג</label>
+          </div>
+
+          <p class="section-label">פרטי קשר</p>
+          <div class="field-row">
+            <label>טלפון</label>
+            <input type="text" name="phone" placeholder="050-0000000">
+            <label class="vis-toggle"><input type="checkbox" name="phone_visible"> להציג</label>
+          </div>
+          <div class="field-row">
+            <label>מייל</label>
+            <input type="text" name="email" placeholder="name@mail.com">
+            <label class="vis-toggle"><input type="checkbox" name="email_visible"> להציג</label>
+          </div>
+          <div class="field-row">
+            <label>אינסטגרם</label>
+            <input type="text" name="instagram" placeholder="@handle">
+            <label class="vis-toggle"><input type="checkbox" name="instagram_visible"> להציג</label>
+          </div>
+          <div class="field-row">
+            <label>טיקטוק</label>
+            <input type="text" name="tiktok" placeholder="@handle">
+            <label class="vis-toggle"><input type="checkbox" name="tiktok_visible"> להציג</label>
+          </div>
+        </div>
+
+        <div id="form-error" class="form-error hidden"></div>
+        <button type="submit" class="btn btn-primary">שמור כרטיס</button>
+      </form>
+    </div>
+  </div>
+
+</div>
+<script src="/static/vendor/socket.io.min.js"></script>
+<script src="/static/app.js?v={{ v }}"></script>
+</body>
+</html>
