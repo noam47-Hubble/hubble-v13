@@ -1,0 +1,2229 @@
+venv/
+__pycache__/
+*.pyc
+*.db
+.DS_Store
+
+"""
+Hubble — cloud version, Phase 1: user identity + multi-card system.
+
+Each browser gets a persistent device_id cookie, which maps to a User.
+A User can hold multiple Cards (business and/or social). Exactly one
+card is "active" at a time — that's the card used when entering hubs
+(hub features land in Phase 2+).
+"""
+
+import os
+import time
+import uuid
+
+from flask import Flask, request, jsonify, render_template, make_response, g
+from flask_socketio import SocketIO, join_room, leave_room, emit
+
+from models import (
+    db, User, Card, CardPhoto, Hub, HubBlock, Favorite, ContactShare, ContactGroup,
+    HubPresence, BoardMessage, PrivateMessage, gen_hub_serial,
+)
+
+app = Flask(__name__)
+app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "hubble-demo-not-for-production")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_DB_PATH = os.path.join(BASE_DIR, "hubble.db")
+db_url = os.environ.get("DATABASE_URL", f"sqlite:///{DEFAULT_DB_PATH}")
+if db_url.startswith("postgres://"):
+    # Render (and some other hosts) hand out the old "postgres://" scheme,
+    # but SQLAlchemy 1.4+ requires "postgresql://" — same database, just the prefix.
+    db_url = db_url.replace("postgres://", "postgresql://", 1)
+app.config["SQLALCHEMY_DATABASE_URI"] = db_url
+app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024  # 25MB — allow real photos/audio through
+db.init_app(app)
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading",
+                     max_http_buffer_size=25 * 1024 * 1024)  # default 1MB was silently dropping images/audio
+
+with app.app_context():
+    db.create_all()
+
+
+# ---------------------------------------------------------------------------
+# Identity: persistent device cookie -> User row
+# ---------------------------------------------------------------------------
+
+DEVICE_COOKIE = "hubble_device_id"
+
+
+@app.before_request
+def load_current_user():
+    device_id = request.cookies.get(DEVICE_COOKIE)
+    user = None
+    new_device_id = None
+    if device_id:
+        user = User.query.filter_by(device_id=device_id).first()
+    if not user:
+        new_device_id = str(uuid.uuid4())
+        user = User(device_id=new_device_id)
+        db.session.add(user)
+        db.session.commit()
+    g.user = user
+    g.new_device_id = new_device_id  # only set if we need to write a fresh cookie
+
+
+@app.after_request
+def persist_device_cookie(response):
+    new_device_id = getattr(g, "new_device_id", None)
+    if new_device_id:
+        response.set_cookie(DEVICE_COOKIE, new_device_id, max_age=60 * 60 * 24 * 365, samesite="Lax", path="/")
+    return response
+
+
+def get_or_create_user():
+    return g.user, g.user.device_id
+
+
+def get_client_ip():
+    """Respects X-Forwarded-For, since a cloud host (Render/Railway) sits behind a proxy."""
+    fwd = request.headers.get("X-Forwarded-For")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.remote_addr or ""
+
+
+# Set once per process start (i.e. changes on every deploy/restart) so the
+# browser can't keep serving a stale cached copy of app.js/style.css after a
+# release — no manual bumping required.
+APP_VERSION = str(int(time.time()))
+
+
+@app.route("/")
+def index():
+    return render_template("index.html", v=APP_VERSION)
+
+
+# ---------------------------------------------------------------------------
+# Session identity — linking a second device/browser to the same person.
+#
+# Identity here is just a cookie, so a different browser or device looks
+# like a brand-new anonymous person by default (this is why "My Hubs" can
+# look empty on your phone if you opened the hub on your laptop). A short
+# code lets someone deliberately link a second browser to their existing
+# identity instead of creating a new one.
+# ---------------------------------------------------------------------------
+
+@app.route("/api/session", methods=["GET"])
+def get_session():
+    user, _ = get_or_create_user()
+    return jsonify({"sync_code": user.sync_code})
+
+
+@app.route("/api/session/link", methods=["POST"])
+def link_session():
+    user, _ = get_or_create_user()
+    data = request.get_json(force=True)
+    code = (data.get("code") or "").strip().upper()
+    target = User.query.filter_by(sync_code=code).first()
+    if not target:
+        return jsonify({"error": "קוד לא נמצא"}), 404
+    merge_user_into(user, target)
+    resp = jsonify({"ok": True, "sync_code": target.sync_code})
+    resp.set_cookie(DEVICE_COOKIE, target.device_id, max_age=60 * 60 * 24 * 365, samesite="Lax", path="/")
+    g.new_device_id = None  # don't let after_request overwrite this with the throwaway anonymous id
+    return resp
+
+
+# ---------------------------------------------------------------------------
+# Registration / login — attach a name + email/phone to a device, or log
+# into an existing identity that already has that email/phone.
+#
+# This is deliberately unverified (no confirmation email/SMS) — it's a demo.
+# The real behaviour it stands in for: on signup, check whether a person
+# with this email/phone already exists; if so treat this browser as *them*
+# (like the sync-code flow) instead of creating a duplicate identity.
+# ---------------------------------------------------------------------------
+
+def merge_user_into(source, target):
+    """Move all of source's data over to target, then delete source.
+
+    Used when someone registers/logs in with an email or phone that already
+    belongs to another identity: rather than just switching the cookie (which
+    would silently orphan anything created under the current anonymous
+    session — cards, hubs, contacts...), we fold it into the existing
+    account so nothing the person already did on this device gets lost.
+    """
+    if source.id == target.id:
+        return
+    db.session.query(Card).filter_by(user_id=source.id).update({Card.user_id: target.id})
+    db.session.query(Hub).filter_by(owner_user_id=source.id).update({Hub.owner_user_id: target.id})
+    db.session.query(Favorite).filter_by(user_id=source.id).update({Favorite.user_id: target.id})
+    db.session.query(ContactGroup).filter_by(owner_user_id=source.id).update({ContactGroup.owner_user_id: target.id})
+    db.session.query(ContactShare).filter_by(owner_user_id=source.id).update({ContactShare.owner_user_id: target.id})
+    db.session.query(ContactShare).filter_by(from_user_id=source.id).update({ContactShare.from_user_id: target.id})
+    db.session.query(HubPresence).filter_by(user_id=source.id).update({HubPresence.user_id: target.id})
+    db.session.query(BoardMessage).filter_by(sender_user_id=source.id).update({BoardMessage.sender_user_id: target.id})
+    db.session.query(PrivateMessage).filter_by(from_user_id=source.id).update({PrivateMessage.from_user_id: target.id})
+    db.session.query(PrivateMessage).filter_by(to_user_id=source.id).update({PrivateMessage.to_user_id: target.id})
+    db.session.delete(source)
+    db.session.commit()
+
+
+@app.route("/api/whoami", methods=["GET"])
+def whoami():
+    user, _ = get_or_create_user()
+    return jsonify({
+        "registered": user.is_registered(),
+        "reg_name": user.reg_name,
+        "email": user.email,
+        "phone": user.phone,
+    })
+
+
+@app.route("/api/register", methods=["POST"])
+def register():
+    user, _ = get_or_create_user()
+    data = request.get_json(force=True)
+    name = (data.get("name") or "").strip()
+    email = (data.get("email") or "").strip().lower() or None
+    phone = (data.get("phone") or "").strip() or None
+
+    if not name:
+        return jsonify({"error": "יש להזין שם"}), 400
+    if not email and not phone:
+        return jsonify({"error": "יש להזין מייל או טלפון"}), 400
+
+    existing = None
+    if email:
+        existing = User.query.filter(User.email == email, User.id != user.id).first()
+    if not existing and phone:
+        existing = User.query.filter(User.phone == phone, User.id != user.id).first()
+
+    if existing:
+        # Someone already registered with this email/phone. Fold whatever was
+        # created under this (anonymous, pre-login) browser session into that
+        # existing identity — cards, hubs, contacts, everything — instead of
+        # just switching the cookie and leaving it behind.
+        merge_user_into(user, existing)
+        resp = jsonify({"ok": True, "logged_in_as_existing": True, "reg_name": existing.reg_name})
+        resp.set_cookie(DEVICE_COOKIE, existing.device_id, max_age=60 * 60 * 24 * 365, samesite="Lax", path="/")
+        g.new_device_id = None
+        return resp
+
+    user.reg_name = name
+    user.email = email
+    user.phone = phone
+    db.session.commit()
+    return jsonify({"ok": True, "logged_in_as_existing": False, "reg_name": name})
+
+
+@app.route("/api/session/switch-account", methods=["POST"])
+def switch_account():
+    """Sign into a DIFFERENT already-registered account from this device —
+    unlike /api/register's merge behavior (which is for restoring your own
+    data after a lost cookie), this is a deliberate account switch, so
+    it does NOT fold the current session's data into the target account."""
+    data = request.get_json(force=True)
+    email = (data.get("email") or "").strip().lower() or None
+    phone = (data.get("phone") or "").strip() or None
+    if not email and not phone:
+        return jsonify({"error": "יש להזין מייל או טלפון"}), 400
+
+    target = None
+    if email:
+        target = User.query.filter_by(email=email).first()
+    if not target and phone:
+        target = User.query.filter_by(phone=phone).first()
+    if not target:
+        return jsonify({"error": "לא נמצא חשבון עם הפרטים האלה"}), 404
+
+    resp = jsonify({"ok": True, "reg_name": target.reg_name})
+    resp.set_cookie(DEVICE_COOKIE, target.device_id, max_age=60 * 60 * 24 * 365, samesite="Lax", path="/")
+    g.new_device_id = None
+    return resp
+
+
+@app.route("/api/session/new-account", methods=["POST"])
+def new_account():
+    """Sign out of the current identity on this device and start a brand
+    new, empty one (so the person can then register a different identity
+    from scratch, without it merging into whichever account was active)."""
+    new_device_id = str(uuid.uuid4())
+    fresh_user = User(device_id=new_device_id)
+    db.session.add(fresh_user)
+    db.session.commit()
+    resp = jsonify({"ok": True})
+    resp.set_cookie(DEVICE_COOKIE, new_device_id, max_age=60 * 60 * 24 * 365, samesite="Lax", path="/")
+    g.new_device_id = None
+    return resp
+
+
+# ---------------------------------------------------------------------------
+# Cards
+# ---------------------------------------------------------------------------
+
+FIELD_NAMES = [
+    "name", "nickname", "title", "company", "phone", "email",
+    "instagram", "tiktok", "mood", "status", "bio",
+]
+
+
+def validate_card_payload(data):
+    """At least one of name/nickname must be present AND visible."""
+    name = (data.get("name") or "").strip()
+    nickname = (data.get("nickname") or "").strip()
+    name_visible = bool(data.get("name_visible", True))
+    nickname_visible = bool(data.get("nickname_visible", False))
+
+    if not name and not nickname:
+        return "Provide a name or a nickname."
+    if not ((name and name_visible) or (nickname and nickname_visible)):
+        return "At least one of name / nickname must be visible."
+    return None
+
+
+@app.route("/api/cards", methods=["GET"])
+def list_cards():
+    user, _ = get_or_create_user()
+    cards = Card.query.filter_by(user_id=user.id).order_by(Card.created_at).all()
+    return jsonify([c.full_dict() for c in cards])
+
+
+@app.route("/api/cards", methods=["POST"])
+def create_card():
+    user, _ = get_or_create_user()
+    data = request.get_json(force=True)
+
+    card_type = data.get("type")
+    if card_type not in ("business", "social"):
+        return jsonify({"error": "type must be 'business' or 'social'"}), 400
+
+    err = validate_card_payload(data)
+    if err:
+        return jsonify({"error": err}), 400
+
+    card = Card(user_id=user.id, card_type=card_type)
+    apply_card_fields(card, data)
+
+    # first card a user creates becomes active automatically
+    existing_count = Card.query.filter_by(user_id=user.id).count()
+    if existing_count == 0:
+        card.is_active = True
+
+    db.session.add(card)
+    db.session.commit()
+    return jsonify(card.full_dict())
+
+
+@app.route("/api/cards/<card_id>", methods=["PUT"])
+def update_card(card_id):
+    user, _ = get_or_create_user()
+    card = Card.query.filter_by(id=card_id, user_id=user.id).first()
+    if not card:
+        return jsonify({"error": "not found"}), 404
+
+    data = request.get_json(force=True)
+    err = validate_card_payload({
+        "name": data.get("name", card.name),
+        "nickname": data.get("nickname", card.nickname),
+        "name_visible": data.get("name_visible", card.name_visible),
+        "nickname_visible": data.get("nickname_visible", card.nickname_visible),
+    })
+    if err:
+        return jsonify({"error": err}), 400
+
+    apply_card_fields(card, data)
+    db.session.commit()
+    return jsonify(card.full_dict())
+
+
+@app.route("/api/cards/<card_id>", methods=["DELETE"])
+def delete_card(card_id):
+    user, _ = get_or_create_user()
+    card = Card.query.filter_by(id=card_id, user_id=user.id).first()
+    if not card:
+        return jsonify({"error": "not found"}), 404
+    was_active = card.is_active
+    db.session.delete(card)
+    db.session.commit()
+
+    if was_active:
+        # promote another card to active, if any remain
+        remaining = Card.query.filter_by(user_id=user.id).first()
+        if remaining:
+            remaining.is_active = True
+            db.session.commit()
+
+    return jsonify({"ok": True})
+
+
+@app.route("/api/cards/<card_id>/activate", methods=["POST"])
+def activate_card(card_id):
+    user, _ = get_or_create_user()
+    card = Card.query.filter_by(id=card_id, user_id=user.id).first()
+    if not card:
+        return jsonify({"error": "not found"}), 404
+
+    Card.query.filter_by(user_id=user.id).update({Card.is_active: False})
+    card.is_active = True
+    db.session.commit()
+    return jsonify(card.full_dict())
+
+
+# ---------------------------------------------------------------------------
+# Card photo gallery — multiple photos per card, each independently
+# shown/hidden on the public card ("show in profile" toggle per photo).
+# ---------------------------------------------------------------------------
+
+@app.route("/api/cards/<card_id>/photos", methods=["POST"])
+def add_card_photo(card_id):
+    user, _ = get_or_create_user()
+    card = Card.query.filter_by(id=card_id, user_id=user.id).first()
+    if not card:
+        return jsonify({"error": "not found"}), 404
+    data = request.get_json(force=True)
+    url = data.get("url")
+    if not url:
+        return jsonify({"error": "חסרה תמונה"}), 400
+    max_order = db.session.query(db.func.max(CardPhoto.order)).filter_by(card_id=card_id).scalar() or 0
+    has_profile_photo = CardPhoto.query.filter_by(card_id=card_id, is_profile_photo=True).first() is not None
+    photo = CardPhoto(
+        card_id=card_id, url=url, is_visible=True, order=max_order + 1,
+        is_profile_photo=not has_profile_photo,  # first photo ever becomes the profile pic by default
+    )
+    db.session.add(photo)
+    if not has_profile_photo:
+        card.photo_url = url  # keep legacy field in sync
+    db.session.commit()
+    return jsonify({"id": photo.id, "url": photo.url, "is_visible": photo.is_visible, "is_profile_photo": photo.is_profile_photo})
+
+
+@app.route("/api/cards/<card_id>/photos/<photo_id>", methods=["PUT"])
+def update_card_photo(card_id, photo_id):
+    """Toggle a single photo's 'show in profile' visibility, or set it as
+    THE profile picture (unselecting any previous one — only one at a time)."""
+    user, _ = get_or_create_user()
+    card = Card.query.filter_by(id=card_id, user_id=user.id).first()
+    if not card:
+        return jsonify({"error": "not found"}), 404
+    photo = CardPhoto.query.filter_by(id=photo_id, card_id=card_id).first()
+    if not photo:
+        return jsonify({"error": "not found"}), 404
+    data = request.get_json(force=True)
+    if "is_visible" in data:
+        photo.is_visible = bool(data.get("is_visible"))
+    if "is_profile_photo" in data:
+        make_profile = bool(data.get("is_profile_photo"))
+        if make_profile:
+            CardPhoto.query.filter_by(card_id=card_id).update({CardPhoto.is_profile_photo: False})
+            photo.is_profile_photo = True
+            card.photo_url = photo.url  # keep legacy field in sync
+        else:
+            photo.is_profile_photo = False
+    db.session.commit()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/cards/<card_id>/photos/<photo_id>", methods=["DELETE"])
+def delete_card_photo(card_id, photo_id):
+    user, _ = get_or_create_user()
+    card = Card.query.filter_by(id=card_id, user_id=user.id).first()
+    if not card:
+        return jsonify({"error": "not found"}), 404
+    photo = CardPhoto.query.filter_by(id=photo_id, card_id=card_id).first()
+    if not photo:
+        return jsonify({"error": "not found"}), 404
+    was_profile_photo = photo.is_profile_photo
+    db.session.delete(photo)
+    db.session.commit()
+    if was_profile_photo:
+        # auto-promote the next visible photo to profile picture, if any
+        remaining = CardPhoto.query.filter_by(card_id=card_id, is_visible=True).order_by(CardPhoto.order).first()
+        if remaining:
+            remaining.is_profile_photo = True
+        card.photo_url = remaining.url if remaining else ""
+        db.session.commit()
+    return jsonify({"ok": True})
+
+
+def apply_card_fields(card, data):
+    for f in FIELD_NAMES:
+        if f in data:
+            setattr(card, f, (data.get(f) or "").strip())
+        vis_key = f + "_visible"
+        if vis_key in data:
+            setattr(card, vis_key, bool(data.get(vis_key)))
+    if "photo_url" in data:
+        card.photo_url = data.get("photo_url") or ""
+    if "is_open_to_contact" in data:
+        card.is_open_to_contact = bool(data.get("is_open_to_contact"))
+
+
+# ---------------------------------------------------------------------------
+# Hubs — list / open / close / favorite  (Phase 2: browsing only, no chat yet)
+# ---------------------------------------------------------------------------
+
+def hub_owner_card(hub):
+    """The card the owner used when opening the hub (their active card at that time)."""
+    return Card.query.filter_by(id=hub.owner_card_id).first()
+
+
+@app.route("/api/hubs", methods=["GET"])
+def list_hubs():
+    user, _ = get_or_create_user()
+    scope = request.args.get("filter", "all")  # all | near | favorites | mine
+
+    query = Hub.query.filter_by(is_open=True)
+
+    if scope == "mine":
+        query = query.filter_by(owner_user_id=user.id)  # owner sees their own drafts too
+    else:
+        query = query.filter_by(is_published=True)  # everyone else only sees published hubs
+        if scope == "favorites":
+            fav_hub_ids = [f.hub_id for f in Favorite.query.filter_by(user_id=user.id).all()]
+            query = query.filter(Hub.id.in_(fav_hub_ids)) if fav_hub_ids else query.filter(False)
+        elif scope == "near":
+            my_ip = get_client_ip()
+            query = query.filter(Hub.owner_public_ip == my_ip) if my_ip else query.filter(False)
+        # scope == "all" -> no extra filter
+
+    hubs = query.order_by(Hub.created_at.desc()).all()
+    fav_ids = {f.hub_id for f in Favorite.query.filter_by(user_id=user.id).all()}
+
+    result = []
+    for hub in hubs:
+        owner_card = hub_owner_card(hub)
+        d = hub.public_dict(owner_card)
+        d["is_favorite"] = hub.id in fav_ids
+        d["is_mine"] = hub.owner_user_id == user.id
+        d["is_physical"] = (hub.owner_public_ip == get_client_ip())
+        result.append(d)
+    return jsonify(result)
+
+
+@app.route("/api/hubs/search", methods=["GET"])
+def search_hubs():
+    q = (request.args.get("q") or "").strip()
+    if not q:
+        return jsonify([])
+    user, _ = get_or_create_user()
+    query = Hub.query.filter_by(is_open=True).filter(
+        db.or_(Hub.name.ilike(f"%{q}%"), Hub.serial == q)
+    ).filter(db.or_(Hub.is_published == True, Hub.owner_user_id == user.id)).order_by(Hub.created_at.desc()).limit(15)  # noqa: E712
+    fav_ids = {f.hub_id for f in Favorite.query.filter_by(user_id=user.id).all()}
+    result = []
+    for hub in query.all():
+        owner_card = hub_owner_card(hub)
+        d = hub.public_dict(owner_card)
+        d["is_favorite"] = hub.id in fav_ids
+        d["is_mine"] = hub.owner_user_id == user.id
+        d["is_physical"] = (hub.owner_public_ip == get_client_ip())
+        result.append(d)
+    return jsonify(result)
+
+
+@app.route("/api/hubs/<hub_id>", methods=["GET"])
+def get_hub(hub_id):
+    """Lightweight lookup used by the invite-link landing flow (?hub=<id>)
+    to show 'you've been invited to X' before the person has a card yet,
+    without requiring a live socket join."""
+    user, _ = get_or_create_user()
+    hub = Hub.query.filter_by(id=hub_id, is_open=True).first()
+    if not hub:
+        return jsonify({"error": "not found or closed"}), 404
+    if not hub.is_published and hub.owner_user_id != user.id:
+        return jsonify({"error": "not found or closed"}), 404
+    owner_card = hub_owner_card(hub)
+    return jsonify(hub.public_dict(owner_card))
+
+
+@app.route("/api/hubs", methods=["POST"])
+def open_hub():
+    user, _ = get_or_create_user()
+    active_card = Card.query.filter_by(user_id=user.id, is_active=True).first()
+    if not active_card:
+        return jsonify({"error": "Create and activate a card before opening a hub."}), 400
+
+    data = request.get_json(force=True)
+    name = (data.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "Hub name is required."}), 400
+    hub_type = data.get("hub_type")
+    if hub_type not in ("social", "professional", "business"):
+        return jsonify({"error": "hub_type must be 'social', 'professional' or 'business'"}), 400
+
+    serial = gen_hub_serial()
+    while Hub.query.filter_by(serial=serial).first():
+        serial = gen_hub_serial()
+
+    VALID_TEMPLATES = {"corporate_classic", "community_dynamic", "creator_purple", "minimalist_dark", "logistics_red"}
+    template_id = data.get("template_id") if data.get("template_id") in VALID_TEMPLATES else "corporate_classic"
+
+    hub = Hub(
+        owner_user_id=user.id,
+        owner_card_id=active_card.id,
+        name=name,
+        serial=serial,
+        hub_type=hub_type,
+        description=(data.get("description") or "").strip(),
+        tagline=(data.get("tagline") or "").strip(),
+        location=(data.get("location") or "").strip(),
+        event_dates=(data.get("event_dates") or "").strip(),
+        logo_url=data.get("logo_url") or "",
+        auto_approve=bool(data.get("auto_approve")),
+        template_id=template_id,
+        # Conference hubs start as an unpublished draft the organizer can
+        # preview and edit before anyone else can find or join it (spec
+        # §4.3), unless they explicitly ask to publish immediately.
+        is_published=not (hub_type == "professional" and not data.get("publish_now")),
+        wifi_label=(data.get("wifi_label") or "").strip(),
+        owner_public_ip=get_client_ip(),
+        is_open=True,
+    )
+    db.session.add(hub)
+    db.session.commit()
+    d = hub.public_dict(active_card)
+    d["is_favorite"] = False
+    d["is_mine"] = True
+    d["is_physical"] = True
+    return jsonify(d)
+
+
+@app.route("/api/hubs/<hub_id>/publish", methods=["POST"])
+def publish_hub(hub_id):
+    """Organizer publishes a draft conference hub, making it findable and
+    joinable by anyone (spec §4.3's edit → preview → publish flow)."""
+    user, _ = get_or_create_user()
+    hub = Hub.query.filter_by(id=hub_id, owner_user_id=user.id).first()
+    if not hub:
+        return jsonify({"error": "not found or not yours"}), 404
+    hub.is_published = True
+    db.session.commit()
+    return jsonify(hub.public_dict(hub_owner_card(hub)))
+
+
+# ---------------------------------------------------------------------------
+# Content blocks — generic modules (agenda, speakers, sponsors, anything
+# else) on a conference hub's page (spec §4). Visible to anyone who can see
+# the hub at all — like a normal event page, the program is public even
+# before someone registers, unlike the board/chat which needs approval.
+# ---------------------------------------------------------------------------
+
+@app.route("/api/hubs/<hub_id>/blocks", methods=["GET"])
+def list_hub_blocks(hub_id):
+    user, _ = get_or_create_user()
+    hub = Hub.query.get(hub_id)
+    if not hub:
+        return jsonify({"error": "not found"}), 404
+    is_owner = hub.owner_user_id == user.id
+    query = HubBlock.query.filter_by(hub_id=hub_id)
+    if not is_owner:
+        query = query.filter_by(is_visible=True)
+    blocks = query.order_by(HubBlock.order).all()
+    return jsonify([b.public_dict() for b in blocks])
+
+
+@app.route("/api/hubs/<hub_id>/blocks", methods=["POST"])
+def create_hub_block(hub_id):
+    user, _ = get_or_create_user()
+    hub = Hub.query.filter_by(id=hub_id, owner_user_id=user.id).first()
+    if not hub:
+        return jsonify({"error": "not found or not yours"}), 404
+    data = request.get_json(force=True)
+    title = (data.get("title") or "").strip()
+    if not title:
+        return jsonify({"error": "יש להזין כותרת לבלוק"}), 400
+    max_order = db.session.query(db.func.max(HubBlock.order)).filter_by(hub_id=hub_id).scalar() or 0
+    block = HubBlock(
+        hub_id=hub_id, title=title,
+        category=data.get("category") or "other",
+        content=(data.get("content") or "").strip(),
+        image_url=data.get("image_url") or "",
+        display_mode=data.get("display_mode") if data.get("display_mode") in ("popup", "inline") else "popup",
+        order=max_order + 1,
+    )
+    db.session.add(block)
+    db.session.commit()
+    socketio.emit("blocks_updated", {"hub_id": hub_id}, room=f"hub:{hub_id}")
+    return jsonify(block.public_dict())
+
+
+@app.route("/api/hubs/<hub_id>/blocks/<block_id>", methods=["PUT"])
+def update_hub_block(hub_id, block_id):
+    user, _ = get_or_create_user()
+    hub = Hub.query.filter_by(id=hub_id, owner_user_id=user.id).first()
+    if not hub:
+        return jsonify({"error": "not found or not yours"}), 404
+    block = HubBlock.query.filter_by(id=block_id, hub_id=hub_id).first()
+    if not block:
+        return jsonify({"error": "not found"}), 404
+    data = request.get_json(force=True)
+    if "title" in data:
+        block.title = (data.get("title") or "").strip()
+    if "category" in data:
+        block.category = data.get("category") or "other"
+    if "content" in data:
+        block.content = (data.get("content") or "").strip()
+    if "image_url" in data:
+        block.image_url = data.get("image_url") or ""
+    if "display_mode" in data and data["display_mode"] in ("popup", "inline"):
+        block.display_mode = data["display_mode"]
+    if "is_visible" in data:
+        block.is_visible = bool(data.get("is_visible"))
+    if "order" in data:
+        block.order = int(data.get("order"))
+    db.session.commit()
+    socketio.emit("blocks_updated", {"hub_id": hub_id}, room=f"hub:{hub_id}")
+    return jsonify(block.public_dict())
+
+
+@app.route("/api/hubs/<hub_id>/blocks/<block_id>", methods=["DELETE"])
+def delete_hub_block(hub_id, block_id):
+    user, _ = get_or_create_user()
+    hub = Hub.query.filter_by(id=hub_id, owner_user_id=user.id).first()
+    if not hub:
+        return jsonify({"error": "not found or not yours"}), 404
+    block = HubBlock.query.filter_by(id=block_id, hub_id=hub_id).first()
+    if not block:
+        return jsonify({"error": "not found"}), 404
+    db.session.delete(block)
+    db.session.commit()
+    socketio.emit("blocks_updated", {"hub_id": hub_id}, room=f"hub:{hub_id}")
+    return jsonify({"ok": True})
+
+
+@app.route("/api/hubs/<hub_id>/blocks/<block_id>/move", methods=["POST"])
+def move_hub_block(hub_id, block_id):
+    """Swap this block's order with its neighbor — a simple 'move up/down'
+    reorder control instead of full drag-and-drop for the demo."""
+    user, _ = get_or_create_user()
+    hub = Hub.query.filter_by(id=hub_id, owner_user_id=user.id).first()
+    if not hub:
+        return jsonify({"error": "not found or not yours"}), 404
+    direction = (request.get_json(force=True) or {}).get("direction")
+    blocks = HubBlock.query.filter_by(hub_id=hub_id).order_by(HubBlock.order).all()
+    idx = next((i for i, b in enumerate(blocks) if b.id == block_id), None)
+    if idx is None:
+        return jsonify({"error": "not found"}), 404
+    swap_idx = idx - 1 if direction == "up" else idx + 1
+    if 0 <= swap_idx < len(blocks):
+        blocks[idx].order, blocks[swap_idx].order = blocks[swap_idx].order, blocks[idx].order
+        db.session.commit()
+        socketio.emit("blocks_updated", {"hub_id": hub_id}, room=f"hub:{hub_id}")
+    return jsonify([b.public_dict() for b in HubBlock.query.filter_by(hub_id=hub_id).order_by(HubBlock.order).all()])
+
+
+# ---------------------------------------------------------------------------
+# Organizer broadcast — spec §"organizer can message everyone / an
+# individual / a sub-group". Individual messaging already works via the
+# normal private-message flow (the owner is just another participant from
+# that angle). This covers "everyone" and a filtered sub-group.
+# ---------------------------------------------------------------------------
+
+@app.route("/api/hubs/<hub_id>/broadcast", methods=["POST"])
+def broadcast_to_hub(hub_id):
+    user, _ = get_or_create_user()
+    hub = Hub.query.filter_by(id=hub_id, owner_user_id=user.id).first()
+    if not hub:
+        return jsonify({"error": "not found or not yours"}), 404
+    data = request.get_json(force=True)
+    text = (data.get("text") or "").strip()
+    if not text:
+        return jsonify({"error": "יש להזין טקסט לשידור"}), 400
+
+    target = data.get("target", "all_approved")  # 'all_approved' | 'pending'
+    query = HubPresence.query.filter_by(hub_id=hub_id)
+    if target == "pending":
+        query = query.filter_by(approval_status="pending")
+    else:
+        query = query.filter_by(approval_status="approved")
+    recipients = [p for p in query.all() if p.user_id != user.id]
+
+    my_name = user.reg_name or resolve_display_name(user.id)
+    for p in recipients:
+        db.session.add(PrivateMessage(hub_id=hub_id, from_user_id=user.id, to_user_id=p.user_id, text=text))
+    db.session.commit()
+
+    payload_base = {
+        "hub_id": hub_id, "hub_name": f'📣 שידור מ-{hub.name}',
+        "from_user_id": user.id, "from_name": f'📣 {my_name} (הודעת ארגונאי)',
+        "text": text, "image": "",
+    }
+    for p in recipients:
+        for sid in USER_SIDS.get(p.user_id, set()):
+            socketio.emit("private_message", {**payload_base, "to_user_id": p.user_id, "id": None, "ts": None}, room=sid)
+    return jsonify({"ok": True, "sent_to": len(recipients)})
+
+
+@app.route("/api/hubs/<hub_id>/report", methods=["GET"])
+def generate_hub_report(hub_id):
+    """On-demand personal report for an attendee (spec §10). Not persisted —
+    built fresh from live data every time. Only the fields each included
+    person has marked visible are shown, same as everywhere else in the app.
+    Export format was left open in the spec; the client renders this as a
+    formatted page with a 'print / save as PDF' action, which covers both
+    the "PDF" and "on-screen" options without extra dependencies."""
+    user, _ = get_or_create_user()
+    hub = Hub.query.get(hub_id)
+    if not hub:
+        return jsonify({"error": "not found"}), 404
+
+    include_directory = request.args.get("directory", "true") == "true"
+    include_contacts = request.args.get("contacts", "true") == "true"
+    include_modules = request.args.get("modules", "true") == "true"
+
+    owner_card = hub_owner_card(hub)
+    report = {"hub": hub.public_dict(owner_card), "generated_at": time.time()}
+
+    if include_modules:
+        blocks = HubBlock.query.filter_by(hub_id=hub_id, is_visible=True).order_by(HubBlock.order).all()
+        report["modules"] = [b.public_dict() for b in blocks]
+
+    if include_directory:
+        presences = HubPresence.query.filter_by(hub_id=hub_id, approval_status="approved").all()
+        report["directory"] = presence_snapshot(hub, presences)
+
+    if include_contacts:
+        shares = ContactShare.query.filter_by(owner_user_id=user.id, hub_id=hub_id).order_by(ContactShare.ts).all()
+        report["my_contacts"] = [{
+            "card": s.card_snapshot, "note": s.note, "ts": s.ts,
+        } for s in shares]
+
+    return jsonify(report)
+
+
+@app.route("/api/hubs/<hub_id>", methods=["PUT"])
+def update_hub(hub_id):
+    """Let the organizer edit their hub's details (name, conference fields,
+    approval mode) after creation, without needing to recreate it."""
+    user, _ = get_or_create_user()
+    hub = Hub.query.filter_by(id=hub_id, owner_user_id=user.id).first()
+    if not hub:
+        return jsonify({"error": "not found or not yours"}), 404
+    data = request.get_json(force=True)
+    for field in ("name", "description", "tagline", "location", "event_dates", "organizer_names"):
+        if field in data:
+            setattr(hub, field, (data.get(field) or "").strip())
+    if "logo_url" in data:
+        hub.logo_url = data.get("logo_url") or ""
+    for vis_field in ("tagline_visible", "location_visible", "event_dates_visible", "logo_visible", "organizer_names_visible"):
+        if vis_field in data:
+            setattr(hub, vis_field, bool(data.get(vis_field)))
+    if "auto_approve" in data:
+        hub.auto_approve = bool(data.get("auto_approve"))
+    if "template_id" in data and data["template_id"] in {"corporate_classic", "community_dynamic", "creator_purple", "minimalist_dark", "logistics_red"}:
+        hub.template_id = data["template_id"]
+    db.session.commit()
+    owner_card = hub_owner_card(hub)
+    socketio.emit("hub_details_updated", {"hub_id": hub_id, "hub": hub.public_dict(owner_card)}, room=f"hub:{hub_id}")
+    return jsonify(hub.public_dict(owner_card))
+
+
+@app.route("/api/hubs/<hub_id>/close", methods=["POST"])
+def close_hub(hub_id):
+    user, _ = get_or_create_user()
+    hub = Hub.query.filter_by(id=hub_id, owner_user_id=user.id).first()
+    if not hub:
+        return jsonify({"error": "not found or not yours"}), 404
+    hub.is_open = False
+    db.session.commit()
+    socketio.emit("hub_closed", {"hub_id": hub.id}, room=f"hub:{hub.id}")
+    return jsonify({"ok": True})
+
+
+@app.route("/api/hubs/<hub_id>/favorite", methods=["POST"])
+def toggle_favorite(hub_id):
+    user, _ = get_or_create_user()
+    hub = Hub.query.filter_by(id=hub_id).first()
+    if not hub:
+        return jsonify({"error": "not found"}), 404
+
+    existing = Favorite.query.filter_by(user_id=user.id, hub_id=hub_id).first()
+    if existing:
+        db.session.delete(existing)
+        db.session.commit()
+        return jsonify({"is_favorite": False})
+    else:
+        db.session.add(Favorite(user_id=user.id, hub_id=hub_id))
+        db.session.commit()
+        return jsonify({"is_favorite": True})
+
+
+# ---------------------------------------------------------------------------
+# My Contacts — cards other people have sent me (populated starting Phase 3)
+# ---------------------------------------------------------------------------
+
+@app.route("/api/contacts", methods=["GET"])
+def list_contacts():
+    user, _ = get_or_create_user()
+    shares = ContactShare.query.filter_by(owner_user_id=user.id).order_by(ContactShare.ts.desc()).all()
+    result = []
+    for s in shares:
+        result.append({
+            "id": s.id,
+            "hub_name": s.hub_name_snapshot,
+            "note": s.note,
+            "ts": s.ts,
+            "card": s.card_snapshot,
+            "from_user_id": s.from_user_id,
+            "group_id": s.group_id,
+            "is_green_now": _contact_is_green_now(s.from_user_id),
+        })
+    return jsonify(result)
+
+
+def _contact_is_green_now(user_id):
+    """True if this person is currently present + open-to-comms in any open hub."""
+    presence = (
+        HubPresence.query.filter_by(user_id=user_id, status="green")
+        .join(Hub, Hub.id == HubPresence.hub_id)
+        .filter(Hub.is_open == True)  # noqa: E712
+        .first()
+    )
+    return bool(presence)
+
+
+@app.route("/api/contacts/<contact_id>", methods=["PUT"])
+def update_contact(contact_id):
+    """Move a saved contact into a sub-group (or back out with group_id=null)."""
+    user, _ = get_or_create_user()
+    share = ContactShare.query.filter_by(id=contact_id, owner_user_id=user.id).first()
+    if not share:
+        return jsonify({"error": "not found"}), 404
+    data = request.get_json(force=True)
+    if "group_id" in data:
+        group_id = data.get("group_id")
+        if group_id:
+            group = ContactGroup.query.filter_by(id=group_id, owner_user_id=user.id).first()
+            if not group:
+                return jsonify({"error": "group not found"}), 404
+        share.group_id = group_id or None
+    if "note" in data:
+        share.note = (data.get("note") or "").strip()
+    db.session.commit()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/contacts/save-visible", methods=["POST"])
+def save_visible_contact():
+    """Save a contact directly from the hub's presence list — no explicit
+    'send' step needed from the other side, since we only ever expose the
+    fields that person already marked visible (Card.public_dict). Only
+    allowed while they're 'green' (open to communication), per the spec."""
+    user, _ = get_or_create_user()
+    data = request.get_json(force=True)
+    hub_id = data.get("hub_id")
+    from_user_id = data.get("from_user_id")
+
+    presence = HubPresence.query.filter_by(hub_id=hub_id, user_id=from_user_id).first()
+    if not presence or presence.status != "green":
+        return jsonify({"error": "אפשר לשמור רק אנשי קשר שמסומנים ירוק (פתוחים לתקשורת)"}), 400
+
+    card = Card.query.get(presence.card_id)
+    hub = Hub.query.get(hub_id)
+    if not card or not hub:
+        return jsonify({"error": "not found"}), 404
+
+    share = ContactShare(
+        owner_user_id=user.id,
+        from_user_id=from_user_id,
+        hub_id=hub_id,
+        hub_name_snapshot=hub.name,
+        card_snapshot=card.public_dict(),
+        note=(data.get("note") or "").strip(),
+    )
+    db.session.add(share)
+    db.session.commit()
+    return jsonify({"ok": True, "id": share.id})
+
+
+# ---------------------------------------------------------------------------
+# Contact groups — sub-groups within "My Contacts" (e.g. "Close friends")
+# ---------------------------------------------------------------------------
+
+@app.route("/api/contact-groups", methods=["GET"])
+def list_contact_groups():
+    user, _ = get_or_create_user()
+    groups = ContactGroup.query.filter_by(owner_user_id=user.id).order_by(ContactGroup.created_at).all()
+    counts = {}
+    for s in ContactShare.query.filter_by(owner_user_id=user.id).all():
+        if s.group_id:
+            counts[s.group_id] = counts.get(s.group_id, 0) + 1
+    return jsonify([{"id": g.id, "name": g.name, "count": counts.get(g.id, 0)} for g in groups])
+
+
+@app.route("/api/contact-groups", methods=["POST"])
+def create_contact_group():
+    user, _ = get_or_create_user()
+    data = request.get_json(force=True)
+    name = (data.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "יש להזין שם לקבוצה"}), 400
+    group = ContactGroup(owner_user_id=user.id, name=name)
+    db.session.add(group)
+    db.session.commit()
+    return jsonify({"id": group.id, "name": group.name, "count": 0})
+
+
+@app.route("/api/contact-groups/<group_id>", methods=["DELETE"])
+def delete_contact_group(group_id):
+    user, _ = get_or_create_user()
+    group = ContactGroup.query.filter_by(id=group_id, owner_user_id=user.id).first()
+    if not group:
+        return jsonify({"error": "not found"}), 404
+    ContactShare.query.filter_by(owner_user_id=user.id, group_id=group_id).update({ContactShare.group_id: None})
+    db.session.delete(group)
+    db.session.commit()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/contact-groups/<group_id>/where", methods=["GET"])
+def group_where_are_they(group_id):
+    """'Where are they' — for each member currently open to communication
+    (green) in some open hub, report which hub. People who are offline or
+    red are simply omitted, per the spec ('only if green')."""
+    user, _ = get_or_create_user()
+    group = ContactGroup.query.filter_by(id=group_id, owner_user_id=user.id).first()
+    if not group:
+        return jsonify({"error": "not found"}), 404
+    shares = ContactShare.query.filter_by(owner_user_id=user.id, group_id=group_id).all()
+    result = []
+    for s in shares:
+        presence = (
+            HubPresence.query.filter_by(user_id=s.from_user_id, status="green")
+            .join(Hub, Hub.id == HubPresence.hub_id)
+            .filter(Hub.is_open == True)  # noqa: E712
+            .first()
+        )
+        if presence:
+            hub = Hub.query.get(presence.hub_id)
+            result.append({
+                "contact_id": s.id,
+                "name": s.card_snapshot.get("name") or s.card_snapshot.get("nickname") or "?",
+                "hub_id": hub.id, "hub_name": hub.name,
+            })
+    return jsonify(result)
+
+
+@app.route("/api/contact-groups/<group_id>/message", methods=["POST"])
+def message_contact_group(group_id):
+    """Send the same text to every member of a sub-group, as a direct
+    (not hub-scoped) private message. Best-effort delivery: online members
+    get it pushed live over the socket; everyone gets the DB row so it
+    shows up next time they open 'My Messages'."""
+    user, _ = get_or_create_user()
+    group = ContactGroup.query.filter_by(id=group_id, owner_user_id=user.id).first()
+    if not group:
+        return jsonify({"error": "not found"}), 404
+    data = request.get_json(force=True)
+    text = (data.get("text") or "").strip()
+    if not text:
+        return jsonify({"error": "יש להזין טקסט"}), 400
+
+    shares = ContactShare.query.filter_by(owner_user_id=user.id, group_id=group_id).all()
+    my_name = user.reg_name or resolve_display_name(user.id)
+    sent = 0
+    for s in shares:
+        pm = PrivateMessage(hub_id=None, from_user_id=user.id, to_user_id=s.from_user_id, text=text)
+        db.session.add(pm)
+        sent += 1
+    db.session.commit()
+    for s in shares:
+        payload = {
+            "id": None, "hub_id": None, "hub_name": f'קבוצה: {group.name}',
+            "from_user_id": user.id, "to_user_id": s.from_user_id,
+            "from_name": my_name, "text": text, "image": "", "ts": None,
+        }
+        for sid in USER_SIDS.get(s.from_user_id, set()):
+            socketio.emit("private_message", payload, room=sid)
+    return jsonify({"ok": True, "sent_to": sent})
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 — inside a hub: presence, general board, private messages, contact sharing
+# ---------------------------------------------------------------------------
+
+# In-memory socket bookkeeping (fine for a single-process demo; would move to
+# a shared store like Redis if this were ever scaled to multiple workers).
+SID_TO_USER = {}    # sid -> user_id
+SID_TO_HUB = {}     # sid -> hub_id
+USER_SIDS = {}       # user_id -> set of sids (a person can have multiple tabs/devices)
+
+
+def resolve_user_from_request():
+    """Same identity lookup as the HTTP before_request hook, usable inside
+    Socket.IO handlers (which don't go through Flask's before_request)."""
+    device_id = request.cookies.get(DEVICE_COOKIE)
+    if not device_id:
+        return None
+    return User.query.filter_by(device_id=device_id).first()
+
+
+def compute_display_names(presences):
+    """Resolve each presence's shown name, appending (1), (2)... on collisions,
+    in join order, per the spec."""
+    names_seen = {}
+    result = {}  # presence.id -> display string
+    ordered = sorted(presences, key=lambda p: p.joined_at)
+    counts = {}
+    for p in ordered:
+        card = Card.query.get(p.card_id)
+        base = card.display_name() if card else "Anonymous"
+        counts[base] = counts.get(base, 0) + 1
+    running = {}
+    for p in ordered:
+        card = Card.query.get(p.card_id)
+        base = card.display_name() if card else "Anonymous"
+        if counts[base] > 1:
+            running[base] = running.get(base, 0) + 1
+            result[p.id] = f"{base}({running[base]})"
+        else:
+            result[p.id] = base
+    return result
+
+
+def presence_snapshot(hub, presences=None):
+    if presences is None:
+        presences = HubPresence.query.filter_by(hub_id=hub.id).all()
+    names = compute_display_names(presences)
+    out = []
+    for p in presences:
+        card = Card.query.get(p.card_id)
+        out.append({
+            "user_id": p.user_id,
+            "card_id": p.card_id,
+            "display_name": names[p.id],
+            "status": p.status,             # 'green' | 'red'
+            "is_physical": p.is_physical,
+            "is_blocked": p.is_blocked,
+            "is_live": p.is_live,
+            "approval_status": p.approval_status,
+            "is_owner": p.user_id == hub.owner_user_id,
+            "card": card.public_dict() if card else {},
+        })
+    # owner always pinned first (spec §6), then live-first, then by join order
+    out.sort(key=lambda r: (not r["is_owner"], not r["is_live"]))
+    return out
+
+
+def emit_presence_list(hub_id):
+    hub = Hub.query.get(hub_id)
+    if not hub:
+        return
+    all_presences = HubPresence.query.filter_by(hub_id=hub_id).all()
+    approved = [p for p in all_presences if p.approval_status == "approved"]
+    live = [p for p in approved if p.is_live]
+
+    names_all = compute_display_names(all_presences)  # shared numbering so (1)/(2) stay consistent everywhere
+
+    def snap(presences):
+        out = []
+        for p in presences:
+            card = Card.query.get(p.card_id)
+            out.append({
+                "user_id": p.user_id, "card_id": p.card_id,
+                "display_name": names_all[p.id],
+                "status": p.status, "is_physical": p.is_physical, "is_blocked": p.is_blocked,
+                "is_live": p.is_live, "approval_status": p.approval_status,
+                "is_owner": p.user_id == hub.owner_user_id,
+                "card": card.public_dict() if card else {},
+            })
+        out.sort(key=lambda r: (not r["is_owner"], not r["is_live"]))
+        return out
+
+    # "who's here now" — the list every hub type has always had
+    socketio.emit("presence_list", snap(live), room=f"hub:{hub_id}")
+
+    if hub.hub_type == "professional":
+        # Full attendee directory (survives people going offline — spec §6)
+        socketio.emit("directory_list", snap(approved), room=f"hub:{hub_id}")
+        # Pending-approval queue — owner only (spec §5)
+        pending = [p for p in all_presences if p.approval_status == "pending"]
+        payload = snap(pending)
+        for sid in USER_SIDS.get(hub.owner_user_id, set()):
+            socketio.emit("pending_list", payload, room=sid)
+
+
+@socketio.on("connect")
+def on_connect():
+    """Register this connection for personal delivery (private messages,
+    notifications) immediately — not just once they join a hub. This is what
+    lets someone get notified of a new private message while they're
+    anywhere in the app, not only while physically inside a hub room."""
+    user = resolve_user_from_request()
+    if user:
+        SID_TO_USER[request.sid] = user.id
+        USER_SIDS.setdefault(user.id, set()).add(request.sid)
+
+
+@socketio.on("leave_hub")
+def on_leave_hub(data=None):
+    """Leave a hub's room without dropping the socket connection entirely —
+    keeps the person reachable for private-message notifications elsewhere
+    in the app."""
+    hub_id = SID_TO_HUB.pop(request.sid, None)
+    if hub_id:
+        leave_room(f"hub:{hub_id}")
+
+
+@socketio.on("join_hub")
+def on_join_hub(data):
+    user = resolve_user_from_request()
+    if not user:
+        emit("error_msg", {"error": "no session — reload the page"})
+        return
+
+    hub = Hub.query.filter_by(id=data.get("hub_id"), is_open=True).first()
+    if not hub:
+        emit("error_msg", {"error": "this hub is not open"})
+        return
+
+    if not hub.is_published and hub.owner_user_id != user.id:
+        emit("error_msg", {"error": "hub still in draft — not published yet"})
+        return
+
+    active_card = Card.query.filter_by(user_id=user.id, is_active=True).first()
+    if not active_card:
+        emit("error_msg", {"error": "activate a card before entering a hub"})
+        return
+
+    # Conference hubs require a business card (spec §5.14) — a social card
+    # gets a clear rejection rather than silently letting them in.
+    if hub.hub_type == "professional" and active_card.card_type != "business":
+        emit("error_msg", {
+            "error": "hub_requires_business_card",
+            "message": "האב הזה מיועד לכנס ודורש כרטיס ביקור עסקי. עברו לכרטיס עסקי או צרו אחד כדי להירשם.",
+        })
+        return
+
+    join_room(f"hub:{hub.id}")
+    SID_TO_USER[request.sid] = user.id
+    SID_TO_HUB[request.sid] = hub.id
+    USER_SIDS.setdefault(user.id, set()).add(request.sid)
+
+    # replace any existing presence for this user in this hub (e.g. rejoining)
+    existing = HubPresence.query.filter_by(hub_id=hub.id, user_id=user.id).first()
+    is_physical = bool(hub.owner_public_ip) and (hub.owner_public_ip == get_client_ip())
+    is_owner = (user.id == hub.owner_user_id)
+
+    if existing:
+        existing.card_id = active_card.id
+        existing.is_physical = is_physical
+        existing.is_live = True
+        existing.last_seen = __import__("time").time()
+        approval_status = existing.approval_status
+    else:
+        # New registrants to a professional hub start 'pending' unless the
+        # organizer enabled auto-approve, or they're the owner themself.
+        approval_status = "approved"
+        if hub.hub_type == "professional" and not hub.auto_approve and not is_owner:
+            approval_status = "pending"
+        db.session.add(HubPresence(
+            hub_id=hub.id, user_id=user.id, card_id=active_card.id,
+            status="green" if active_card.is_open_to_contact else "red",
+            is_physical=is_physical, is_live=True,
+            approval_status=approval_status,
+        ))
+    db.session.commit()
+    emit_presence_list(hub.id)
+
+    if approval_status == "pending":
+        # Give them just enough to show a "waiting for approval" screen —
+        # no board history, no full attendee list — until the organizer acts.
+        owner_card = hub_owner_card(hub)
+        emit("hub_pending", {"hub": hub.public_dict(owner_card)})
+        return
+
+    board = BoardMessage.query.filter_by(hub_id=hub.id).order_by(BoardMessage.ts).limit(200).all()
+    owner_card = hub_owner_card(hub)
+
+    # Restore this person's private conversations *within this hub* too —
+    # otherwise leaving and re-joining wipes the in-hub private panel even
+    # though the messages are still safely in the database (spec item: history
+    # must survive leaving/re-entering a hub).
+    my_private = (
+        PrivateMessage.query.filter_by(hub_id=hub.id)
+        .filter(db.or_(PrivateMessage.from_user_id == user.id, PrivateMessage.to_user_id == user.id))
+        .order_by(PrivateMessage.ts)
+        .all()
+    )
+    private_history = {}
+    for m in my_private:
+        other_id = m.to_user_id if m.from_user_id == user.id else m.from_user_id
+        sender_presence = HubPresence.query.filter_by(hub_id=hub.id, user_id=m.from_user_id).first()
+        sender_card = Card.query.get(sender_presence.card_id) if sender_presence else None
+        private_history.setdefault(other_id, []).append({
+            "id": m.id, "hub_id": hub.id,
+            "from_user_id": m.from_user_id, "to_user_id": m.to_user_id,
+            "from_name": sender_card.display_name() if sender_card else resolve_display_name(m.from_user_id),
+            "text": m.text, "image": m.image_url, "ts": m.ts,
+        })
+
+    emit("hub_state", {
+        "hub": {**hub.public_dict(owner_card), "wifi_label": hub.wifi_label, "is_mine": hub.owner_user_id == user.id},
+        "my_user_id": user.id,
+        "board": [board_msg_dict(m, hub) for m in board],
+        "private_history": private_history,
+    })
+
+
+@socketio.on("set_status")
+def on_set_status(data):
+    user_id = SID_TO_USER.get(request.sid)
+    hub_id = SID_TO_HUB.get(request.sid)
+    if not user_id or not hub_id:
+        return
+    status = data.get("status")
+    if status not in ("green", "red"):
+        return
+    presence = HubPresence.query.filter_by(hub_id=hub_id, user_id=user_id).first()
+    if presence:
+        presence.status = status
+        # Persist as the personal default for next time too (spec: this
+        # replaces the old per-hub-only header toggle with a card-level
+        # setting that still updates live from here).
+        card = Card.query.get(presence.card_id)
+        if card:
+            card.is_open_to_contact = (status == "green")
+        db.session.commit()
+        emit_presence_list(hub_id)
+
+
+def board_msg_dict(m, hub=None):
+    sender_card = Card.query.get(m.sender_card_id)
+    if hub is None:
+        hub = Hub.query.get(m.hub_id)
+    return {
+        "id": m.id,
+        "sender_user_id": m.sender_user_id,
+        "sender_name": sender_card.display_name() if sender_card else "Anonymous",
+        "sender_type": sender_card.card_type if sender_card else "social",
+        "is_owner": bool(hub and hub.owner_user_id == m.sender_user_id),
+        "text": m.text,
+        "image": m.image_url,
+        "ts": m.ts,
+    }
+
+
+@socketio.on("send_board_message")
+def on_send_board_message(data):
+    user_id = SID_TO_USER.get(request.sid)
+    hub_id = SID_TO_HUB.get(request.sid)
+    if not user_id or not hub_id:
+        emit("error_msg", {"error": "join the hub first"})
+        return
+    presence = HubPresence.query.filter_by(hub_id=hub_id, user_id=user_id).first()
+    if not presence:
+        return
+    if presence.is_blocked:
+        emit("error_msg", {"error": "the hub owner has blocked you from posting"})
+        return
+
+    text = (data.get("text") or "").strip()
+    image = data.get("image") or ""
+    if not text and not image:
+        return
+
+    msg = BoardMessage(hub_id=hub_id, sender_user_id=user_id, sender_card_id=presence.card_id,
+                        text=text, image_url=image)
+    db.session.add(msg)
+    db.session.commit()
+    hub = Hub.query.get(hub_id)
+    socketio.emit("board_message", board_msg_dict(msg, hub), room=f"hub:{hub_id}")
+
+
+@socketio.on("delete_board_message")
+def on_delete_board_message(data):
+    """A person may delete their own posts from the hub's general board."""
+    user_id = SID_TO_USER.get(request.sid)
+    hub_id = SID_TO_HUB.get(request.sid)
+    msg_id = data.get("message_id")
+    if not user_id or not hub_id or not msg_id:
+        return
+    msg = BoardMessage.query.filter_by(id=msg_id, hub_id=hub_id).first()
+    if not msg or msg.sender_user_id != user_id:
+        emit("error_msg", {"error": "אפשר למחוק רק הודעות שהעלית בעצמך"})
+        return
+    db.session.delete(msg)
+    db.session.commit()
+    socketio.emit("board_message_deleted", {"id": msg_id}, room=f"hub:{hub_id}")
+
+
+@socketio.on("send_private_message")
+def on_send_private_message(data):
+    from_user_id = SID_TO_USER.get(request.sid)
+    hub_id = SID_TO_HUB.get(request.sid)
+    to_user_id = data.get("to_user_id")
+    if not from_user_id or not hub_id or not to_user_id:
+        return
+
+    hub = Hub.query.get(hub_id)
+    from_presence = HubPresence.query.filter_by(hub_id=hub_id, user_id=from_user_id).first()
+
+    # A person blocked by the hub owner may still reach out to the OWNER
+    # (to explain themselves / ask to be unblocked) but not to anyone else,
+    # in either the general board or private messages.
+    if from_presence and from_presence.is_blocked and hub and to_user_id != hub.owner_user_id:
+        emit("error_msg", {"error": "נחסמת על ידי הבעלים. שלח לו הודעה פרטית."})
+        return
+
+    to_presence = HubPresence.query.filter_by(hub_id=hub_id, user_id=to_user_id).first()
+    if not to_presence or to_presence.status != "green":
+        emit("error_msg", {"error": "that person isn't open to messages right now"})
+        return
+
+    from_card = Card.query.get(from_presence.card_id) if from_presence else None
+
+    text = (data.get("text") or "").strip()
+    image = data.get("image") or ""
+    if not text and not image:
+        return
+
+    pm = PrivateMessage(hub_id=hub_id, from_user_id=from_user_id, to_user_id=to_user_id,
+                         text=text, image_url=image)
+    db.session.add(pm)
+    db.session.commit()
+
+    payload = {
+        "id": pm.id, "hub_id": hub_id,
+        "from_user_id": from_user_id, "to_user_id": to_user_id,
+        "from_name": from_card.display_name() if from_card else "Anonymous",
+        "text": text, "image": image, "ts": pm.ts,
+    }
+    for sid in USER_SIDS.get(from_user_id, set()):
+        socketio.emit("private_message", payload, room=sid)
+    for sid in USER_SIDS.get(to_user_id, set()):
+        socketio.emit("private_message", payload, room=sid)
+
+
+@socketio.on("delete_private_message")
+def on_delete_private_message(data):
+    """Delete a private message I sent — usable from the in-hub private
+    panel. (The 'My Messages' screen uses the REST DELETE endpoint instead,
+    since it isn't necessarily connected to a hub's socket room.)"""
+    user_id = SID_TO_USER.get(request.sid)
+    msg_id = data.get("message_id")
+    if not user_id or not msg_id:
+        return
+    msg = PrivateMessage.query.filter_by(id=msg_id).first()
+    if not msg or msg.from_user_id != user_id:
+        emit("error_msg", {"error": "אפשר למחוק רק הודעות שאתה שלחת"})
+        return
+    other_id = msg.to_user_id
+    db.session.delete(msg)
+    db.session.commit()
+    payload = {"id": msg_id, "other_user_id": other_id}
+    for sid in USER_SIDS.get(user_id, set()):
+        socketio.emit("private_message_deleted", payload, room=sid)
+    payload_for_other = {"id": msg_id, "other_user_id": user_id}
+    for sid in USER_SIDS.get(other_id, set()):
+        socketio.emit("private_message_deleted", payload_for_other, room=sid)
+
+
+@socketio.on("share_contact")
+def on_share_contact(data):
+    """Sender chooses which fields of their card to expose and sends them to
+    another participant. This does NOT save to the recipient's contacts by
+    itself — the recipient explicitly saves it (with their own note) via
+    POST /api/contacts, matching the spec's send -> review -> save flow."""
+    from_user_id = SID_TO_USER.get(request.sid)
+    hub_id = SID_TO_HUB.get(request.sid)
+    to_user_id = data.get("to_user_id")
+    fields = data.get("fields") or {}
+    if not from_user_id or not hub_id or not to_user_id:
+        return
+
+    from_presence = HubPresence.query.filter_by(hub_id=hub_id, user_id=from_user_id).first()
+    from_card = Card.query.get(from_presence.card_id) if from_presence else None
+    hub = Hub.query.get(hub_id)
+    if not from_card or not hub:
+        return
+
+    # only pass through fields the sender's card actually has marked visible-capable
+    # (the sender explicitly picked these in the UI; we trust but scope to real field names)
+    allowed = {k: v for k, v in fields.items() if k in FIELD_NAMES and v}
+
+    payload = {
+        "from_user_id": from_user_id,
+        "from_name": from_card.display_name(),
+        "hub_id": hub_id,
+        "hub_name": hub.name,
+        "fields": allowed,
+    }
+    for sid in USER_SIDS.get(to_user_id, set()):
+        socketio.emit("contact_offer", payload, room=sid)
+
+
+@socketio.on("owner_approve_attendee")
+def on_owner_approve_attendee(data):
+    owner_id = SID_TO_USER.get(request.sid)
+    presence = HubPresence.query.get(data.get("presence_id")) if data.get("presence_id") else None
+    if not presence:
+        presence = HubPresence.query.filter_by(
+            hub_id=data.get("hub_id"), user_id=data.get("user_id")
+        ).first()
+    if not presence:
+        return
+    hub = Hub.query.get(presence.hub_id)
+    if not hub or hub.owner_user_id != owner_id:
+        emit("error_msg", {"error": "only the hub owner can approve attendees"})
+        return
+    presence.approval_status = "approved"
+    db.session.commit()
+    emit_presence_list(hub.id)
+    # let the approved person's own client flip from the waiting screen to the real hub
+    for sid in USER_SIDS.get(presence.user_id, set()):
+        socketio.emit("registration_approved", {"hub_id": hub.id}, room=sid)
+
+
+@socketio.on("owner_reject_attendee")
+def on_owner_reject_attendee(data):
+    owner_id = SID_TO_USER.get(request.sid)
+    presence = HubPresence.query.get(data.get("presence_id")) if data.get("presence_id") else None
+    if not presence:
+        presence = HubPresence.query.filter_by(
+            hub_id=data.get("hub_id"), user_id=data.get("user_id")
+        ).first()
+    if not presence:
+        return
+    hub = Hub.query.get(presence.hub_id)
+    if not hub or hub.owner_user_id != owner_id:
+        emit("error_msg", {"error": "only the hub owner can reject attendees"})
+        return
+    rejected_user_id, hub_id = presence.user_id, hub.id
+    db.session.delete(presence)
+    db.session.commit()
+    emit_presence_list(hub_id)
+    for sid in USER_SIDS.get(rejected_user_id, set()):
+        socketio.emit("registration_rejected", {"hub_id": hub_id}, room=sid)
+
+
+@socketio.on("disconnect")
+def on_disconnect():
+    user_id = SID_TO_USER.pop(request.sid, None)
+    hub_id = SID_TO_HUB.pop(request.sid, None)
+    if user_id and user_id in USER_SIDS:
+        USER_SIDS[user_id].discard(request.sid)
+        still_connected = bool(USER_SIDS[user_id])
+        if not USER_SIDS[user_id]:
+            del USER_SIDS[user_id]
+        # Once ALL of this user's tabs/sockets for this hub are gone, mark
+        # them offline rather than deleting their presence row — a
+        # professional hub's attendee directory (spec §6) needs to keep
+        # showing people who registered even while they're not currently
+        # connected. (For social/business hubs this is invisible: the "who's
+        # here now" list already only shows is_live rows, same as before.)
+        if hub_id and not still_connected:
+            presence = HubPresence.query.filter_by(hub_id=hub_id, user_id=user_id).first()
+            if presence:
+                presence.is_live = False
+                db.session.commit()
+            emit_presence_list(hub_id)
+
+
+def is_hub_owner(hub_id, user_id):
+    hub = Hub.query.get(hub_id)
+    return bool(hub) and hub.owner_user_id == user_id
+
+
+@socketio.on("update_hub_background")
+def on_update_hub_background(data):
+    user_id = SID_TO_USER.get(request.sid)
+    hub_id = SID_TO_HUB.get(request.sid)
+    if not user_id or not hub_id or not is_hub_owner(hub_id, user_id):
+        emit("error_msg", {"error": "only the hub owner can change this"})
+        return
+    hub = Hub.query.get(hub_id)
+    if "image_url" in data:
+        hub.background_image_url = data.get("image_url") or ""
+    if "music_url" in data:
+        hub.background_music_url = data.get("music_url") or ""
+    db.session.commit()
+    socketio.emit("hub_background_updated", {
+        "background_image_url": hub.background_image_url,
+        "background_music_url": hub.background_music_url,
+    }, room=f"hub:{hub_id}")
+
+
+@socketio.on("toggle_block")
+def on_toggle_block(data):
+    user_id = SID_TO_USER.get(request.sid)
+    hub_id = SID_TO_HUB.get(request.sid)
+    if not user_id or not hub_id or not is_hub_owner(hub_id, user_id):
+        emit("error_msg", {"error": "only the hub owner can do this"})
+        return
+    target_user_id = data.get("user_id")
+    presence = HubPresence.query.filter_by(hub_id=hub_id, user_id=target_user_id).first()
+    if not presence:
+        return
+    presence.is_blocked = not presence.is_blocked
+    db.session.commit()
+    emit_presence_list(hub_id)
+
+
+@socketio.on("owner_close_hub")
+def on_owner_close_hub(data):
+    user_id = SID_TO_USER.get(request.sid)
+    hub_id = SID_TO_HUB.get(request.sid)
+    if not user_id or not hub_id or not is_hub_owner(hub_id, user_id):
+        emit("error_msg", {"error": "only the hub owner can close this hub"})
+        return
+    hub = Hub.query.get(hub_id)
+    hub.is_open = False
+    db.session.commit()
+    socketio.emit("hub_closed", {"hub_id": hub_id}, room=f"hub:{hub_id}")
+
+
+@app.route("/api/hubs/<hub_id>/background", methods=["POST"])
+def update_hub_background_rest(hub_id):
+    """Uploading images/audio through a normal HTTP POST is far more robust
+    than pushing large base64 payloads through a Socket.IO message, which
+    was silently hitting the default message-size limit."""
+    user, _ = get_or_create_user()
+    hub = Hub.query.filter_by(id=hub_id, owner_user_id=user.id).first()
+    if not hub:
+        return jsonify({"error": "not found or not yours"}), 404
+
+    data = request.get_json(force=True)
+    if "image_url" in data:
+        hub.background_image_url = data.get("image_url") or ""
+    if "music_url" in data:
+        hub.background_music_url = data.get("music_url") or ""
+    db.session.commit()
+
+    payload = {
+        "background_image_url": hub.background_image_url,
+        "background_music_url": hub.background_music_url,
+    }
+    socketio.emit("hub_background_updated", payload, room=f"hub:{hub_id}")
+    return jsonify(payload)
+
+
+# ---------------------------------------------------------------------------
+# My Messages — private messages I've received, across all hubs
+# ---------------------------------------------------------------------------
+
+def resolve_display_name(user_id):
+    card = Card.query.filter_by(user_id=user_id, is_active=True).first()
+    if not card:
+        card = Card.query.filter_by(user_id=user_id).first()
+    return card.display_name() if card else "Anonymous"
+
+
+@app.route("/api/messages", methods=["GET"])
+def list_my_messages():
+    """One row per correspondent (not per message) — the inbox view. Each
+    row carries whether that person is currently green (open to comms) in
+    some open hub, so the UI can show/enable the reply composer accordingly."""
+    user, _ = get_or_create_user()
+    received = PrivateMessage.query.filter_by(to_user_id=user.id).all()
+    sent = PrivateMessage.query.filter_by(from_user_id=user.id).all()
+
+    by_correspondent = {}
+    for m in received + sent:
+        other_id = m.from_user_id if m.to_user_id == user.id else m.to_user_id
+        entry = by_correspondent.setdefault(other_id, {"last_ts": 0, "last_text": "", "hub_name": "—"})
+        if m.ts and m.ts >= entry["last_ts"]:
+            entry["last_ts"] = m.ts
+            entry["last_text"] = m.text or ("📷 תמונה" if m.image_url else "")
+            hub = Hub.query.get(m.hub_id) if m.hub_id else None
+            entry["hub_name"] = hub.name if hub else "הודעה ישירה"
+
+    out = []
+    for other_id, entry in by_correspondent.items():
+        out.append({
+            "user_id": other_id,
+            "from_name": resolve_display_name(other_id),
+            "hub_name": entry["hub_name"],
+            "last_text": entry["last_text"],
+            "ts": entry["last_ts"],
+            "is_green_now": _contact_is_green_now(other_id),
+        })
+    out.sort(key=lambda r: r["ts"], reverse=True)
+    return jsonify(out)
+
+
+@app.route("/api/messages/thread/<other_user_id>", methods=["GET"])
+def get_message_thread(other_user_id):
+    """Full back-and-forth with one specific person, for the chat view
+    inside 'My Messages'."""
+    user, _ = get_or_create_user()
+    msgs = (
+        PrivateMessage.query.filter(
+            db.or_(
+                db.and_(PrivateMessage.from_user_id == user.id, PrivateMessage.to_user_id == other_user_id),
+                db.and_(PrivateMessage.from_user_id == other_user_id, PrivateMessage.to_user_id == user.id),
+            )
+        )
+        .order_by(PrivateMessage.ts)
+        .all()
+    )
+    out = [{
+        "id": m.id, "from_user_id": m.from_user_id, "to_user_id": m.to_user_id,
+        "mine": m.from_user_id == user.id,
+        "text": m.text, "image": m.image_url, "ts": m.ts,
+    } for m in msgs]
+    return jsonify(out)
+
+
+@app.route("/api/messages/<message_id>", methods=["DELETE"])
+def delete_private_message_rest(message_id):
+    """Delete a private message I sent, from the 'My Messages' screen
+    (not necessarily connected to any hub's socket room right now)."""
+    user, _ = get_or_create_user()
+    msg = PrivateMessage.query.filter_by(id=message_id).first()
+    if not msg or msg.from_user_id != user.id:
+        return jsonify({"error": "אפשר למחוק רק הודעות ששלחת בעצמך"}), 403
+    other_id = msg.to_user_id
+    db.session.delete(msg)
+    db.session.commit()
+    payload = {"id": message_id, "other_user_id": user.id}
+    for sid in USER_SIDS.get(other_id, set()):
+        socketio.emit("private_message_deleted", payload, room=sid)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/messages/reply", methods=["POST"])
+def reply_to_message():
+    """Send a private message from the 'My Messages' screen — decoupled from
+    any live hub join, so a reply works even if neither person is currently
+    inside the hub where the conversation started."""
+    user, _ = get_or_create_user()
+    data = request.get_json(force=True)
+    to_user_id = data.get("to_user_id")
+    text = (data.get("text") or "").strip()
+    if not to_user_id or not text:
+        return jsonify({"error": "נא להזין הודעה"}), 400
+
+    pm = PrivateMessage(hub_id=None, from_user_id=user.id, to_user_id=to_user_id, text=text)
+    db.session.add(pm)
+    db.session.commit()
+
+    payload = {
+        "id": pm.id, "hub_id": None, "hub_name": "הודעה ישירה",
+        "from_user_id": user.id, "to_user_id": to_user_id,
+        "from_name": user.reg_name or resolve_display_name(user.id),
+        "text": text, "image": "", "ts": pm.ts,
+    }
+    for sid in USER_SIDS.get(to_user_id, set()):
+        socketio.emit("private_message", payload, room=sid)
+    return jsonify({"ok": True, "id": pm.id, "ts": pm.ts})
+
+
+@app.route("/api/contacts", methods=["POST"])
+def save_contact():
+    """The recipient of a shared contact card explicitly saves it, with their
+    own note, into their contacts list."""
+    user, _ = get_or_create_user()
+    data = request.get_json(force=True)
+    hub = Hub.query.get(data.get("hub_id"))
+    share = ContactShare(
+        owner_user_id=user.id,
+        from_user_id=data.get("from_user_id"),
+        hub_id=data.get("hub_id"),
+        hub_name_snapshot=data.get("hub_name") or (hub.name if hub else ""),
+        card_snapshot=data.get("fields") or {},
+        note=(data.get("note") or "").strip(),
+    )
+    db.session.add(share)
+    db.session.commit()
+    return jsonify({"ok": True, "id": share.id})
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5050))
+    socketio.run(app, host="0.0.0.0", port=port, debug=False, allow_unsafe_werkzeug=True)
+
+# פריסה לענן — Render (שלב 6)
+
+הקוד כבר מוכן לפריסה (Procfile, requirements.txt מעודכן, תמיכה ב-DATABASE_URL
+ו-SECRET_KEY דרך משתני סביבה). הצעדים הבאים הם בצד שלך.
+
+## שלב 1 — GitHub
+
+אם אין לך חשבון: הירשם בחינם ב-https://github.com
+
+צור repository חדש וריק:
+1. לחץ על "+" למעלה מימין → "New repository"
+2. שם: `hubble-cloud` (או כל שם אחר)
+3. השאר "Private" אם אתה רוצה שהקוד יישאר פרטי
+4. **אל תסמן** "Add a README file" — תיצור repo ריק לגמרי
+5. לחץ "Create repository"
+
+## שלב 2 — העלאת הקוד
+
+בטרמינל, בתוך תיקיית `hubble-cloud` (זו שמכילה את `app.py`):
+
+```bash
+git init
+git add .
+git commit -m "Initial commit"
+git branch -M main
+git remote add origin https://github.com/USERNAME/hubble-cloud.git
+git push -u origin main
+```
+
+**שים לב:** תחליף `USERNAME` בשם המשתמש שלך ב-GitHub, ו-`hubble-cloud` בשם
+שנתת ל-repo אם בחרת שם אחר. GitHub יראה לך את הכתובת המדויקת בעמוד שנפתח
+אחרי יצירת ה-repo (תחת "…or push an existing repository from the command
+line").
+
+בפעם הראשונה שתריץ `git push`, ייתכן שתתבקש להתחבר — GitHub לא מקבל יותר
+סיסמה רגילה בשורת הפקודה; אם תתבקש, עקוב אחרי ההוראות שלהם ליצירת "Personal
+Access Token" (זה תהליך של דקה, מוסבר בעמוד עצמו).
+
+## שלב 3 — Render
+
+הירשם בחינם ב-https://render.com, ולחץ "Connect GitHub" כדי לחבר את
+החשבון (הרשאה חד-פעמית).
+
+### 3א — מסד הנתונים (PostgreSQL)
+
+1. בדשבורד של Render: "New +" → "PostgreSQL"
+2. שם: `hubble-db` (או כל שם)
+3. Plan: **Free**
+4. לחץ "Create Database"
+5. אחרי שהוא נוצר, גלול לשדה **"Internal Database URL"** והעתק אותו —
+   תצטרך אותו בשלב הבא
+
+### 3ב — ה-Web Service
+
+1. "New +" → "Web Service"
+2. בחר את ה-repo `hubble-cloud` שיצרת
+3. Runtime: Python 3
+4. Build Command: `pip install -r requirements.txt`
+5. Start Command: (משאירים ריק — Render קורא את זה אוטומטית מה-`Procfile`)
+6. Plan: **Free**
+7. לפני שלוחצים Create, גלול ל-"Environment Variables" והוסף:
+   - `DATABASE_URL` = (מה שהעתקת משלב 3א)
+   - `SECRET_KEY` = כל מחרוזת אקראית (למשל `hubble-secret-2026-xyz`)
+8. לחץ "Create Web Service"
+
+Render יתחיל לבנות ולפרוס — זה לוקח כמה דקות בפעם הראשונה. בסיום תקבל
+כתובת ציבורית כמו `https://hubble-cloud.onrender.com`.
+
+## שלב 4 — בדיקה
+
+פתח את הכתובת, צור כרטיס, פתח האב, ונסה מהטלפון/מחשב נוסף (לא צריך
+להיות על אותה רשת WiFi יותר — זה כל הכיף בענן).
+
+## עדכון עתידי
+
+כשאני אתקן באג או אוסיף פיצ'ר, פשוט תריץ שוב בתיקייה שלך:
+
+```bash
+git add .
+git commit -m "עדכון"
+git push
+```
+
+Render יבחין בעדכון ויפרוס אותו אוטומטית תוך דקה־שתיים.
+
+## תזכורות
+
+- השרת החינמי "נרדם" אחרי 15 דקות ללא תנועה — הבקשה הראשונה אחרי זה
+  לוקחת כ-30-60 שניות. כדאי "להעיר" אותו יום לפני דמו חשוב (סתם לפתוח
+  את הכתובת בדפדפן).
+- מסד הנתונים החינמי נמחק אוטומטית אחרי 90 יום — לגמרי מספיק לדמו,
+  רק לזכור את זה קדימה.
+
+"""
+Data models for Hubble (cloud/multi-user version).
+
+Design notes:
+- Users are identified by a persistent browser cookie (device_id) — no
+  email/password needed for a demo. Good enough to distinguish people;
+  not meant to be secure auth.
+- A Card holds arbitrary fields as JSON so we can add field types without
+  schema migrations. Every field can be independently marked visible/hidden.
+- "name" and "nickname" are first-class columns (not inside the JSON blob)
+  because the app enforces a rule on them (at least one must be visible).
+"""
+
+import random
+import string
+import time
+import uuid
+
+from flask_sqlalchemy import SQLAlchemy
+
+db = SQLAlchemy()
+
+
+def gen_id():
+    return str(uuid.uuid4())
+
+
+def gen_sync_code():
+    return "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
+
+
+def gen_hub_serial():
+    return "".join(random.choices(string.digits, k=4))
+
+
+class User(db.Model):
+    id = db.Column(db.String, primary_key=True, default=gen_id)
+    device_id = db.Column(db.String, unique=True, nullable=False, index=True)
+    sync_code = db.Column(db.String, unique=True, nullable=False, default=gen_sync_code, index=True)
+    created_at = db.Column(db.Float, default=time.time)
+
+    # Registration identity (Phase 5). Optional by design — a device gets an
+    # anonymous User immediately (see before_request), and registering just
+    # attaches a name/email/phone to it, or links the cookie to an existing
+    # matching identity so the same person can log in from a new device.
+    reg_name = db.Column(db.String, default="")
+    email = db.Column(db.String, unique=True, nullable=True, index=True)
+    phone = db.Column(db.String, unique=True, nullable=True, index=True)
+
+    cards = db.relationship("Card", backref="user", lazy=True, cascade="all, delete-orphan")
+
+    def is_registered(self):
+        return bool(self.email or self.phone)
+
+
+class Card(db.Model):
+    id = db.Column(db.String, primary_key=True, default=gen_id)
+    user_id = db.Column(db.String, db.ForeignKey("user.id"), nullable=False)
+
+    card_type = db.Column(db.String, nullable=False)  # 'business' | 'social'
+    is_active = db.Column(db.Boolean, default=False)  # only one active card per user at a time
+
+    name = db.Column(db.String, default="")
+    name_visible = db.Column(db.Boolean, default=True)
+    nickname = db.Column(db.String, default="")
+    nickname_visible = db.Column(db.Boolean, default=False)
+
+    photo_url = db.Column(db.String, default="")  # data URL for the demo
+
+    # Default communication openness (spec: replaces the hub-header
+    # green/red toggle — a personal default carried into every hub, still
+    # adjustable live per-hub via the dot next to one's own name).
+    is_open_to_contact = db.Column(db.Boolean, default=True)
+
+    # Business fields
+    title = db.Column(db.String, default="")
+    title_visible = db.Column(db.Boolean, default=True)
+    company = db.Column(db.String, default="")
+    company_visible = db.Column(db.Boolean, default=True)
+
+    # Social / contact fields — each has its own visibility flag
+    phone = db.Column(db.String, default="")
+    phone_visible = db.Column(db.Boolean, default=False)
+    email = db.Column(db.String, default="")
+    email_visible = db.Column(db.Boolean, default=False)
+    instagram = db.Column(db.String, default="")
+    instagram_visible = db.Column(db.Boolean, default=False)
+    tiktok = db.Column(db.String, default="")
+    tiktok_visible = db.Column(db.Boolean, default=False)
+
+    mood = db.Column(db.String, default="")
+    mood_visible = db.Column(db.Boolean, default=True)
+    status = db.Column(db.String, default="")
+    status_visible = db.Column(db.Boolean, default=True)
+    bio = db.Column(db.String, default="")
+    bio_visible = db.Column(db.Boolean, default=True)
+
+    created_at = db.Column(db.Float, default=time.time)
+
+    photos = db.relationship("CardPhoto", backref="card", lazy=True, cascade="all, delete-orphan")
+
+    def display_name(self):
+        """Respects the visibility rule: show name if visible, else nickname, else 'Anonymous'."""
+        if self.name_visible and self.name:
+            return self.name
+        if self.nickname_visible and self.nickname:
+            return self.nickname
+        return self.name or self.nickname or "Anonymous"
+
+    def public_dict(self):
+        """Only the fields this card's owner has marked visible. photo_url is
+        specifically the one photo marked as the profile picture (shown next
+        to the name everywhere); photos is the fuller gallery — allowed for
+        others to browse only once they open the full profile."""
+        visible_photos = [p.url for p in sorted(self.photos, key=lambda p: p.order) if p.is_visible]
+        profile_photo = next((p.url for p in self.photos if p.is_profile_photo), None)
+        out = {
+            "id": self.id, "type": self.card_type,
+            "photo_url": profile_photo or self.photo_url,
+            "photos": visible_photos,
+        }
+        field_pairs = [
+            ("name", "name_visible"), ("nickname", "nickname_visible"),
+            ("title", "title_visible"), ("company", "company_visible"),
+            ("phone", "phone_visible"), ("email", "email_visible"),
+            ("instagram", "instagram_visible"), ("tiktok", "tiktok_visible"),
+            ("mood", "mood_visible"), ("status", "status_visible"), ("bio", "bio_visible"),
+        ]
+        for field, vis_field in field_pairs:
+            if getattr(self, vis_field):
+                val = getattr(self, field)
+                if val:
+                    out[field] = val
+        return out
+
+    def full_dict(self):
+        """Every field + its visibility flag, for editing in the owner's own UI."""
+        field_pairs = [
+            "name", "nickname", "title", "company", "phone", "email",
+            "instagram", "tiktok", "mood", "status", "bio",
+        ]
+        profile_photo = next((p.url for p in self.photos if p.is_profile_photo), None)
+        out = {
+            "id": self.id, "type": self.card_type, "is_active": self.is_active,
+            "photo_url": profile_photo or self.photo_url,
+            "is_open_to_contact": self.is_open_to_contact,
+            "photos": [
+                {"id": p.id, "url": p.url, "is_visible": p.is_visible, "is_profile_photo": p.is_profile_photo}
+                for p in sorted(self.photos, key=lambda p: p.order)
+            ],
+        }
+        for f in field_pairs:
+            out[f] = getattr(self, f)
+            out[f + "_visible"] = getattr(self, f + "_visible")
+        return out
+
+
+class CardPhoto(db.Model):
+    """One photo in a card's gallery. is_visible: allowed to be seen by
+    others when they open the full profile. is_profile_photo: the ONE
+    picture (at most) shown inline next to the name everywhere — selecting
+    a new one automatically clears the flag on any other photo."""
+    id = db.Column(db.String, primary_key=True, default=gen_id)
+    card_id = db.Column(db.String, db.ForeignKey("card.id"), nullable=False)
+    url = db.Column(db.Text, nullable=False)  # data URL for the demo
+    is_visible = db.Column(db.Boolean, default=True)
+    is_profile_photo = db.Column(db.Boolean, default=False)
+    order = db.Column(db.Integer, default=0)
+    created_at = db.Column(db.Float, default=time.time)
+
+
+class HubBlock(db.Model):
+    """A generic content block on a conference hub's page (spec §4 —
+    optional modules like agenda, speakers, sponsors...). Kept generic
+    (title + free text/image) rather than one table per module type: the
+    organizer can represent any of those with a block, and specialized
+    module types can be layered on top of this later without a schema
+    change if that turns out to be needed."""
+    id = db.Column(db.String, primary_key=True, default=gen_id)
+    hub_id = db.Column(db.String, db.ForeignKey("hub.id"), nullable=False)
+    category = db.Column(db.String, default="other")  # one of the preset picklist values, or 'other'
+    title = db.Column(db.String, default="")
+    content = db.Column(db.Text, default="")
+    image_url = db.Column(db.Text, default="")  # data URL for the demo
+    display_mode = db.Column(db.String, default="popup")  # 'popup' | 'inline' — organizer's choice per block
+    order = db.Column(db.Integer, default=0)
+    is_visible = db.Column(db.Boolean, default=True)
+    created_at = db.Column(db.Float, default=time.time)
+
+    def public_dict(self):
+        return {
+            "id": self.id, "category": self.category, "title": self.title,
+            "content": self.content, "image_url": self.image_url,
+            "display_mode": self.display_mode,
+            "order": self.order, "is_visible": self.is_visible,
+        }
+
+
+class Hub(db.Model):
+    id = db.Column(db.String, primary_key=True, default=gen_id)
+    owner_user_id = db.Column(db.String, db.ForeignKey("user.id"), nullable=False)
+    owner = db.relationship("User", foreign_keys=[owner_user_id])
+    owner_card_id = db.Column(db.String, db.ForeignKey("card.id"), nullable=True)
+
+    name = db.Column(db.String, nullable=False)
+    serial = db.Column(db.String, unique=True, nullable=True, index=True)  # 4-digit, for search/lookup
+    hub_type = db.Column(db.String, default="social")  # 'social' | 'professional' | 'business'
+    description = db.Column(db.String, default="")
+
+    # Conference-specific required fields (spec §4.1). Kept on the base Hub
+    # model rather than a separate table since only one hub type uses them
+    # for now, and it avoids a join on every hub read.
+    tagline = db.Column(db.String, default="")       # subtitle
+    location = db.Column(db.String, default="")
+    event_dates = db.Column(db.String, default="")   # free text, e.g. "Nov 14–16, 2026"
+    logo_url = db.Column(db.Text, default="")         # data URL for the demo
+
+    # Each optional field has its own independent show/hide toggle (spec §3),
+    # separate from whether content was entered — the organizer can prepare
+    # a field and still choose not to display it yet.
+    tagline_visible = db.Column(db.Boolean, default=True)
+    location_visible = db.Column(db.Boolean, default=True)
+    event_dates_visible = db.Column(db.Boolean, default=True)
+    logo_visible = db.Column(db.Boolean, default=True)
+
+    # Bottom-of-page optional field (spec §3c) — free text the organizer types.
+    organizer_names = db.Column(db.String, default="")
+    organizer_names_visible = db.Column(db.Boolean, default=True)
+
+    # Registration approval (spec §5). Off by default for existing hub
+    # types — only meaningful when hub_type == 'professional'.
+    auto_approve = db.Column(db.Boolean, default=False)
+
+    # Design (spec §4.2): which of the 5 pre-built templates this hub uses.
+    template_id = db.Column(db.String, default="corporate_classic")
+
+    # Draft → preview → publish (spec §4.3). New professional hubs start
+    # unpublished so the organizer can review before anyone can find/join.
+    # Other hub types default True to keep their existing "instant" behavior.
+    is_published = db.Column(db.Boolean, default=True)
+
+    wifi_label = db.Column(db.String, default="")   # display-only name the owner types in
+    owner_public_ip = db.Column(db.String, default="")  # used for the physical-presence heuristic
+
+    background_image_url = db.Column(db.String, default="")
+    background_music_url = db.Column(db.String, default="")
+
+    is_open = db.Column(db.Boolean, default=True)
+    created_at = db.Column(db.Float, default=time.time)
+
+    def public_dict(self, owner_card=None):
+        return {
+            "hub_id": self.id,
+            "name": self.name,
+            "serial": self.serial,
+            "hub_type": self.hub_type,
+            "description": self.description,
+            "tagline": self.tagline,
+            "location": self.location,
+            "event_dates": self.event_dates,
+            "logo_url": self.logo_url,
+            "organizer_names": self.organizer_names,
+            "tagline_visible": self.tagline_visible,
+            "location_visible": self.location_visible,
+            "event_dates_visible": self.event_dates_visible,
+            "logo_visible": self.logo_visible,
+            "organizer_names_visible": self.organizer_names_visible,
+            "auto_approve": self.auto_approve,
+            "template_id": self.template_id,
+            "is_published": self.is_published,
+            "owner_name": owner_card.display_name() if owner_card else "",
+            "is_open": self.is_open,
+            "background_image_url": self.background_image_url,
+            "background_music_url": self.background_music_url,
+        }
+
+
+class Favorite(db.Model):
+    id = db.Column(db.String, primary_key=True, default=gen_id)
+    user_id = db.Column(db.String, db.ForeignKey("user.id"), nullable=False)
+    hub_id = db.Column(db.String, db.ForeignKey("hub.id"), nullable=False)
+
+
+class HubPresence(db.Model):
+    """A person's membership + live state in a hub. For social/business hubs
+    this row simply disappears when they leave (as before). For professional
+    hubs it doubles as the persistent attendee-roster entry (spec §6 needs
+    both a live "who's here now" list AND a full attendee directory that
+    survives people going offline) — is_live distinguishes the two without
+    a second table."""
+    id = db.Column(db.String, primary_key=True, default=gen_id)
+    hub_id = db.Column(db.String, db.ForeignKey("hub.id"), nullable=False)
+    user_id = db.Column(db.String, db.ForeignKey("user.id"), nullable=False)
+    card_id = db.Column(db.String, db.ForeignKey("card.id"), nullable=False)
+
+    status = db.Column(db.String, default="green")  # 'green' open to comms | 'red' present, not available
+    is_physical = db.Column(db.Boolean, default=False)  # same public IP as hub owner
+    is_blocked = db.Column(db.Boolean, default=False)   # blocked by hub owner from posting
+    is_live = db.Column(db.Boolean, default=True)        # currently connected (vs. roster-only / offline)
+
+    # Registration approval (spec §5) — only meaningful for professional
+    # hubs; everyone else defaults to 'approved' so existing behavior for
+    # social/business hubs is untouched.
+    approval_status = db.Column(db.String, default="approved")  # 'pending' | 'approved'
+
+    joined_at = db.Column(db.Float, default=time.time)
+    last_seen = db.Column(db.Float, default=time.time)
+
+
+class BoardMessage(db.Model):
+    id = db.Column(db.String, primary_key=True, default=gen_id)
+    hub_id = db.Column(db.String, db.ForeignKey("hub.id"), nullable=False)
+    sender_user_id = db.Column(db.String, db.ForeignKey("user.id"), nullable=False)
+    sender_card_id = db.Column(db.String, db.ForeignKey("card.id"), nullable=False)
+    text = db.Column(db.Text, default="")
+    image_url = db.Column(db.Text, default="")
+    ts = db.Column(db.Float, default=time.time)
+
+
+class PrivateMessage(db.Model):
+    id = db.Column(db.String, primary_key=True, default=gen_id)
+    # Nullable: a message sent from "My Messages" (e.g. a reply, or a message
+    # to a whole contact group) isn't necessarily tied to a live hub session.
+    hub_id = db.Column(db.String, db.ForeignKey("hub.id"), nullable=True)
+    from_user_id = db.Column(db.String, db.ForeignKey("user.id"), nullable=False)
+    to_user_id = db.Column(db.String, db.ForeignKey("user.id"), nullable=False)
+    text = db.Column(db.Text, default="")
+    image_url = db.Column(db.Text, default="")
+    ts = db.Column(db.Float, default=time.time)
+
+
+class ContactGroup(db.Model):
+    """A user-defined sub-group inside 'My Contacts', e.g. 'Close friends'."""
+    id = db.Column(db.String, primary_key=True, default=gen_id)
+    owner_user_id = db.Column(db.String, db.ForeignKey("user.id"), nullable=False)
+    name = db.Column(db.String, nullable=False)
+    created_at = db.Column(db.Float, default=time.time)
+
+
+class ContactShare(db.Model):
+    """A card someone sent me, saved into 'My Contacts'."""
+    id = db.Column(db.String, primary_key=True, default=gen_id)
+    owner_user_id = db.Column(db.String, db.ForeignKey("user.id"), nullable=False)  # who received it
+    from_user_id = db.Column(db.String, db.ForeignKey("user.id"), nullable=False)
+    hub_id = db.Column(db.String, db.ForeignKey("hub.id"), nullable=False)
+    hub_name_snapshot = db.Column(db.String, default="")
+    group_id = db.Column(db.String, db.ForeignKey("contact_group.id"), nullable=True)
+
+    card_snapshot = db.Column(db.JSON, default=dict)  # the fields that were shared, frozen at send time
+    note = db.Column(db.Text, default="")  # "my notes" the receiver added when saving
+    ts = db.Column(db.Float, default=time.time)
+
+web: gunicorn --worker-class gthread --threads 8 -w 1 --bind 0.0.0.0:$PORT app:app
+
+# Hubble — Cloud Version (Phase 1–4, bugfix round)
+
+## Fixes in this round
+1. **Private message images** — root cause: Socket.IO's default 1MB message
+   size limit was silently dropping larger images. Raised to 25MB.
+2. **My Contacts not clickable** — rows now open the full saved card (all
+   shared fields + your note).
+3. **"My Hubs" showing empty** — this was a *cross-device identity* issue:
+   each browser/device gets its own anonymous identity by default, so a hub
+   opened on your laptop won't show as "mine" on your phone. Added an
+   identity-sync code (Home screen → "חיבור בין מכשירים"): copy the code
+   from one device, paste it into another, and they become the same
+   identity, sharing cards/hubs/contacts.
+4. **New "ההודעות שלי" page** — aggregates all private messages you've
+   received, across every hub, with sender + hub name.
+5. **"Hubs near me" empty** — this one is inherent to local testing: the
+   physical-presence check compares public IP addresses, which only line
+   up correctly once the server sits behind a real NAT boundary (i.e. once
+   deployed to the cloud in Phase 6). Locally, each device shows its own
+   distinct LAN IP, so nothing matches yet — this isn't a bug, it will
+   start working correctly after deployment.
+6. **Background image/music not loading, not stopping on leaving the hub,
+   couldn't re-edit** — root cause: the same 1MB Socket.IO limit as #1 was
+   silently dropping the upload before it ever reached the server. Switched
+   background/music upload to a normal HTTP POST (more robust for large
+   files) and applied immediately client-side instead of only via
+   broadcast. Also fixed: leaving a hub now properly stops the music and
+   clears the background.
+7. **Hub ownership confusion** — same root cause as #3 (cross-device
+   identity). Ownership itself was always correctly tied to the person who
+   opened the hub, not to which card was active — the sync-code feature is
+   the real fix here too.
+
+## Run locally
+```bash
+python3 -m venv venv
+source venv/bin/activate      # Windows: venv\Scripts\activate
+pip install -r requirements.txt
+python3 app.py
+```
+Open http://localhost:5050
+
+## Next: Phase 6 — deploy to a free cloud tier with a public URL
+(Phase 5, the guided demo-script mode, is on hold per request.)
+
+flask
+flask-socketio
+flask-sqlalchemy
+simple-websocket
+gunicorn
+psycopg2-binary
